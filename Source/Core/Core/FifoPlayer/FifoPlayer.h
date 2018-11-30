@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -15,6 +16,11 @@
 class FifoDataFile;
 struct MemoryUpdate;
 struct AnalyzedFrameInfo;
+
+namespace CPU
+{
+enum class State;
+}
 
 // Story time:
 // When FifoRecorder was created, efb copies weren't really used or they used efb2tex which ignored
@@ -51,7 +57,7 @@ extern bool IsPlayingBackFifologWithBrokenEFBCopies;
 class FifoPlayer
 {
 public:
-  typedef void (*CallbackFunc)(void);
+  using CallbackFunc = std::function<void()>;
 
   ~FifoPlayer();
 
@@ -65,8 +71,10 @@ public:
   // PowerPC state.
   std::unique_ptr<CPUCoreBase> GetCPUCore();
 
-  FifoDataFile* GetFile() { return m_File.get(); }
-  u32 GetFrameObjectCount();
+  bool IsPlaying() const;
+
+  FifoDataFile* GetFile() const { return m_File.get(); }
+  u32 GetFrameObjectCount() const;
   u32 GetCurrentFrameNum() const { return m_CurrentFrame; }
   const AnalyzedFrameInfo& GetAnalyzedFrameInfo(u32 frame) const { return m_FrameInfo[frame]; }
   // Frame range
@@ -89,12 +97,14 @@ public:
   void SetFrameWrittenCallback(CallbackFunc callback) { m_FrameWrittenCb = callback; }
   static FifoPlayer& GetInstance();
 
+  bool IsRunningWithFakeVideoInterfaceUpdates() const;
+
 private:
   class CPUCore;
 
   FifoPlayer();
 
-  int AdvanceFrame();
+  CPU::State AdvanceFrame();
 
   void WriteFrame(const FifoFrameInfo& frame, const AnalyzedFrameInfo& info);
   void WriteFramePart(u32 dataStart, u32 dataEnd, u32& nextMemUpdate, const FifoFrameInfo& frame,
@@ -110,6 +120,8 @@ private:
   void SetupFifo();
 
   void LoadMemory();
+  void LoadRegisters();
+  void LoadTextureMemory();
 
   void WriteCP(u32 address, u16 value);
   void WritePI(u32 address, u32 value);
@@ -119,7 +131,7 @@ private:
   void LoadBPReg(u8 reg, u32 value);
   void LoadCPReg(u8 reg, u32 value);
   void LoadXFReg(u16 reg, u32 value);
-  void LoadXFMem16(u16 address, u32* data);
+  void LoadXFMem16(u16 address, const u32* data);
 
   bool ShouldLoadBP(u8 address);
 
@@ -128,21 +140,21 @@ private:
 
   bool m_Loop;
 
-  u32 m_CurrentFrame;
-  u32 m_FrameRangeStart;
-  u32 m_FrameRangeEnd;
+  u32 m_CurrentFrame = 0;
+  u32 m_FrameRangeStart = 0;
+  u32 m_FrameRangeEnd = 0;
 
-  u32 m_ObjectRangeStart;
-  u32 m_ObjectRangeEnd;
+  u32 m_ObjectRangeStart = 0;
+  u32 m_ObjectRangeEnd = 10000;
 
-  bool m_EarlyMemoryUpdates;
+  bool m_EarlyMemoryUpdates = false;
 
-  u64 m_CyclesPerFrame;
-  u32 m_ElapsedCycles;
-  u32 m_FrameFifoSize;
+  u64 m_CyclesPerFrame = 0;
+  u32 m_ElapsedCycles = 0;
+  u32 m_FrameFifoSize = 0;
 
-  CallbackFunc m_FileLoadedCb;
-  CallbackFunc m_FrameWrittenCb;
+  CallbackFunc m_FileLoadedCb = nullptr;
+  CallbackFunc m_FrameWrittenCb = nullptr;
 
   std::unique_ptr<FifoDataFile> m_File;
 

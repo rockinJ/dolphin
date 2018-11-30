@@ -2,16 +2,19 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include "Core/HW/ProcessorInterface.h"
+
 #include <cstdio>
+#include <memory>
 
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/MMIO.h"
-#include "Core/HW/ProcessorInterface.h"
-#include "Core/IPC_HLE/WII_IPC_HLE.h"
-#include "Core/IPC_HLE/WII_IPC_HLE_Device_stm.h"
+#include "Core/HW/SystemTimers.h"
+#include "Core/IOS/IOS.h"
+#include "Core/IOS/STM/STM.h"
 #include "Core/PowerPC/PowerPC.h"
 
 namespace ProcessorInterface
@@ -30,11 +33,14 @@ static u32 m_FlipperRev;
 static u32 m_Unknown;
 
 // ID and callback for scheduling reset button presses/releases
-static int toggleResetButton;
+static CoreTiming::EventType* toggleResetButton;
 static void ToggleResetButtonCallback(u64 userdata, s64 cyclesLate);
 
-static int iosNotifyResetButton;
+static CoreTiming::EventType* iosNotifyResetButton;
 static void IOSNotifyResetButtonCallback(u64 userdata, s64 cyclesLate);
+
+static CoreTiming::EventType* iosNotifyPowerButton;
+static void IOSNotifyPowerButtonCallback(u64 userdata, s64 cyclesLate);
 
 // Let the PPC know that an external exception is set/cleared
 void UpdateException();
@@ -74,6 +80,8 @@ void Init()
   toggleResetButton = CoreTiming::RegisterEvent("ToggleResetButton", ToggleResetButtonCallback);
   iosNotifyResetButton =
       CoreTiming::RegisterEvent("IOSNotifyResetButton", IOSNotifyResetButtonCallback);
+  iosNotifyPowerButton =
+      CoreTiming::RegisterEvent("IOSNotifyPowerButton", IOSNotifyPowerButtonCallback);
 }
 
 void RegisterMMIO(MMIO::Mapping* mmio, u32 base)
@@ -127,9 +135,9 @@ void UpdateException()
     PowerPC::ppcState.Exceptions &= ~EXCEPTION_EXTERNAL_INT;
 }
 
-static const char* Debug_GetInterruptName(u32 _causemask)
+static const char* Debug_GetInterruptName(u32 cause_mask)
 {
-  switch (_causemask)
+  switch (cause_mask)
   {
   case INT_CAUSE_PI:
     return "INT_CAUSE_PI";
@@ -168,33 +176,33 @@ static const char* Debug_GetInterruptName(u32 _causemask)
   }
 }
 
-void SetInterrupt(u32 _causemask, bool _bSet)
+void SetInterrupt(u32 cause_mask, bool set)
 {
-  _dbg_assert_msg_(POWERPC, Core::IsCPUThread(), "SetInterrupt from wrong thread");
+  DEBUG_ASSERT_MSG(POWERPC, Core::IsCPUThread(), "SetInterrupt from wrong thread");
 
-  if (_bSet && !(m_InterruptCause & _causemask))
+  if (set && !(m_InterruptCause & cause_mask))
   {
-    DEBUG_LOG(PROCESSORINTERFACE, "Setting Interrupt %s (set)", Debug_GetInterruptName(_causemask));
+    DEBUG_LOG(PROCESSORINTERFACE, "Setting Interrupt %s (set)", Debug_GetInterruptName(cause_mask));
   }
 
-  if (!_bSet && (m_InterruptCause & _causemask))
+  if (!set && (m_InterruptCause & cause_mask))
   {
     DEBUG_LOG(PROCESSORINTERFACE, "Setting Interrupt %s (clear)",
-              Debug_GetInterruptName(_causemask));
+              Debug_GetInterruptName(cause_mask));
   }
 
-  if (_bSet)
-    m_InterruptCause |= _causemask;
+  if (set)
+    m_InterruptCause |= cause_mask;
   else
-    m_InterruptCause &= ~_causemask;  // is there any reason to have this possibility?
+    m_InterruptCause &= ~cause_mask;  // is there any reason to have this possibility?
   // F|RES: i think the hw devices reset the interrupt in the PI to 0
   // if the interrupt cause is eliminated. that isn't done by software (afaik)
   UpdateException();
 }
 
-static void SetResetButton(bool _bSet)
+static void SetResetButton(bool set)
 {
-  SetInterrupt(INT_CAUSE_RST_BUTTON, !_bSet);
+  SetInterrupt(INT_CAUSE_RST_BUTTON, !set);
 }
 
 static void ToggleResetButtonCallback(u64 userdata, s64 cyclesLate)
@@ -204,20 +212,41 @@ static void ToggleResetButtonCallback(u64 userdata, s64 cyclesLate)
 
 static void IOSNotifyResetButtonCallback(u64 userdata, s64 cyclesLate)
 {
-  if (SConfig::GetInstance().bWii)
-  {
-    std::shared_ptr<IWII_IPC_HLE_Device> stm =
-        WII_IPC_HLE_Interface::GetDeviceByName("/dev/stm/eventhook");
-    if (stm)
-      std::static_pointer_cast<CWII_IPC_HLE_Device_stm_eventhook>(stm)->ResetButton();
-  }
+  const auto ios = IOS::HLE::GetIOS();
+  if (!ios)
+    return;
+
+  auto stm = ios->GetDeviceByName("/dev/stm/eventhook");
+  if (stm)
+    std::static_pointer_cast<IOS::HLE::Device::STMEventHook>(stm)->ResetButton();
+}
+
+static void IOSNotifyPowerButtonCallback(u64 userdata, s64 cyclesLate)
+{
+  const auto ios = IOS::HLE::GetIOS();
+  if (!ios)
+    return;
+
+  auto stm = ios->GetDeviceByName("/dev/stm/eventhook");
+  if (stm)
+    std::static_pointer_cast<IOS::HLE::Device::STMEventHook>(stm)->PowerButton();
 }
 
 void ResetButton_Tap()
 {
-  CoreTiming::ScheduleEvent_AnyThread(0, toggleResetButton, true);
-  CoreTiming::ScheduleEvent_AnyThread(0, iosNotifyResetButton, 0);
-  CoreTiming::ScheduleEvent_AnyThread(243000000, toggleResetButton, false);
+  if (!Core::IsRunning())
+    return;
+  CoreTiming::ScheduleEvent(0, toggleResetButton, true, CoreTiming::FromThread::ANY);
+  CoreTiming::ScheduleEvent(0, iosNotifyResetButton, 0, CoreTiming::FromThread::ANY);
+  CoreTiming::ScheduleEvent(SystemTimers::GetTicksPerSecond() / 2, toggleResetButton, false,
+                            CoreTiming::FromThread::ANY);
+}
+
+void PowerButton_Tap()
+{
+  if (!Core::IsRunning())
+    return;
+  CoreTiming::ScheduleEvent(0, iosNotifyPowerButton, 0, CoreTiming::FromThread::ANY);
 }
 
 }  // namespace ProcessorInterface

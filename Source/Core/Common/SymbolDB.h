@@ -8,42 +8,44 @@
 #pragma once
 
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "Common/CommonTypes.h"
 
+namespace Common
+{
 struct SCall
 {
-  SCall(u32 a, u32 b) : function(a), callAddress(b) {}
+  SCall(u32 a, u32 b) : function(a), call_address(b) {}
   u32 function;
-  u32 callAddress;
+  u32 call_address;
 };
 
 struct Symbol
 {
-  enum
+  enum class Type
   {
-    SYMBOL_FUNCTION = 0,
-    SYMBOL_DATA = 1,
+    Function,
+    Data,
   };
 
-  Symbol() : hash(0), address(0), flags(0), size(0), numCalls(0), type(SYMBOL_FUNCTION), analyzed(0)
-  {
-  }
+  void Rename(const std::string& symbol_name);
 
   std::string name;
+  std::string function_name;   // stripped function name
   std::vector<SCall> callers;  // addresses of functions that call this function
   std::vector<SCall> calls;    // addresses of functions that are called by this function
-  u32 hash;                    // use for HLE function finding
-  u32 address;
-  u32 flags;
-  int size;
-  int numCalls;
-  int type;
-  int index;  // only used for coloring the disasm view
-  int analyzed;
+  u32 hash = 0;                // use for HLE function finding
+  u32 address = 0;
+  u32 flags = 0;
+  u32 size = 0;
+  int num_calls = 0;
+  Type type = Type::Function;
+  int index = 0;  // only used for coloring the disasm view
+  bool analyzed = false;
 };
 
 enum
@@ -59,33 +61,29 @@ enum
 class SymbolDB
 {
 public:
-  typedef std::map<u32, Symbol> XFuncMap;
-  typedef std::map<u32, Symbol*> XFuncPtrMap;
+  using XFuncMap = std::map<u32, Symbol>;
+  using XFuncPtrMap = std::map<u32, std::set<Symbol*>>;
 
-protected:
-  XFuncMap functions;
-  XFuncPtrMap checksumToFunction;
+  SymbolDB();
+  virtual ~SymbolDB();
 
-public:
-  SymbolDB() {}
-  virtual ~SymbolDB() {}
   virtual Symbol* GetSymbolFromAddr(u32 addr) { return nullptr; }
-  virtual Symbol* AddFunction(u32 startAddr) { return nullptr; }
+  virtual Symbol* AddFunction(u32 start_addr) { return nullptr; }
   void AddCompleteSymbol(const Symbol& symbol);
 
   Symbol* GetSymbolFromName(const std::string& name);
-  Symbol* GetSymbolFromHash(u32 hash)
-  {
-    XFuncPtrMap::iterator iter = checksumToFunction.find(hash);
-    if (iter != checksumToFunction.end())
-      return iter->second;
-    else
-      return nullptr;
-  }
+  std::vector<Symbol*> GetSymbolsFromName(const std::string& name);
+  Symbol* GetSymbolFromHash(u32 hash);
+  std::vector<Symbol*> GetSymbolsFromHash(u32 hash);
 
-  const XFuncMap& Symbols() const { return functions; }
-  XFuncMap& AccessSymbols() { return functions; }
+  const XFuncMap& Symbols() const { return m_functions; }
+  XFuncMap& AccessSymbols() { return m_functions; }
   void Clear(const char* prefix = "");
   void List();
   void Index();
+
+protected:
+  XFuncMap m_functions;
+  XFuncPtrMap m_checksum_to_function;
 };
+}  // namespace Common

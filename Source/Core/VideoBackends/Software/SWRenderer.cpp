@@ -2,165 +2,109 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
-#include <algorithm>
-#include <atomic>
-#include <mutex>
+#include "VideoBackends/Software/SWRenderer.h"
+
 #include <string>
 
 #include "Common/CommonTypes.h"
-#include "Common/FileUtil.h"
-#include "Common/Logging/Log.h"
-#include "Common/StringUtil.h"
+#include "Common/GL/GLContext.h"
 
-#include "Core/ConfigManager.h"
+#include "Core/Config/GraphicsSettings.h"
 #include "Core/HW/Memmap.h"
 
 #include "VideoBackends/Software/EfbCopy.h"
+#include "VideoBackends/Software/EfbInterface.h"
 #include "VideoBackends/Software/SWOGLWindow.h"
-#include "VideoBackends/Software/SWRenderer.h"
+#include "VideoBackends/Software/SWTexture.h"
 
+#include "VideoCommon/AbstractPipeline.h"
+#include "VideoCommon/AbstractShader.h"
 #include "VideoCommon/BoundingBox.h"
-#include "VideoCommon/Fifo.h"
-#include "VideoCommon/ImageWrite.h"
 #include "VideoCommon/OnScreenDisplay.h"
+#include "VideoCommon/VideoBackendBase.h"
 #include "VideoCommon/VideoConfig.h"
 
-static u8* s_xfbColorTexture[2];
-static int s_currentColorTexture = 0;
-
-SWRenderer::~SWRenderer()
+SWRenderer::SWRenderer(std::unique_ptr<SWOGLWindow> window)
+    : ::Renderer(static_cast<int>(MAX_XFB_WIDTH), static_cast<int>(MAX_XFB_HEIGHT)),
+      m_window(std::move(window))
 {
-  delete[] s_xfbColorTexture[0];
-  delete[] s_xfbColorTexture[1];
 }
 
-void SWRenderer::Init()
+bool SWRenderer::IsHeadless() const
 {
-  s_xfbColorTexture[0] = new u8[MAX_XFB_WIDTH * MAX_XFB_HEIGHT * 4];
-  s_xfbColorTexture[1] = new u8[MAX_XFB_WIDTH * MAX_XFB_HEIGHT * 4];
-
-  s_currentColorTexture = 0;
+  return m_window->IsHeadless();
 }
 
-void SWRenderer::Shutdown()
+std::unique_ptr<AbstractTexture> SWRenderer::CreateTexture(const TextureConfig& config)
 {
-  g_Config.bRunning = false;
-  UpdateActiveConfig();
+  return std::make_unique<SW::SWTexture>(config);
+}
+
+std::unique_ptr<AbstractStagingTexture>
+SWRenderer::CreateStagingTexture(StagingTextureType type, const TextureConfig& config)
+{
+  return std::make_unique<SW::SWStagingTexture>(type, config);
+}
+
+std::unique_ptr<AbstractFramebuffer>
+SWRenderer::CreateFramebuffer(const AbstractTexture* color_attachment,
+                              const AbstractTexture* depth_attachment)
+{
+  return SW::SWFramebuffer::Create(static_cast<const SW::SWTexture*>(color_attachment),
+                                   static_cast<const SW::SWTexture*>(depth_attachment));
 }
 
 void SWRenderer::RenderText(const std::string& pstr, int left, int top, u32 color)
 {
-  SWOGLWindow::s_instance->PrintText(pstr, left, top, color);
+  m_window->PrintText(pstr, left, top, color);
 }
 
-u8* SWRenderer::GetNextColorTexture()
+class SWShader final : public AbstractShader
 {
-  return s_xfbColorTexture[!s_currentColorTexture];
+public:
+  explicit SWShader(ShaderStage stage) : AbstractShader(stage) {}
+  ~SWShader() = default;
+
+  bool HasBinary() const override { return false; }
+  BinaryData GetBinary() const override { return {}; }
+};
+
+std::unique_ptr<AbstractShader>
+SWRenderer::CreateShaderFromSource(ShaderStage stage, const char* source, size_t length)
+{
+  return std::make_unique<SWShader>(stage);
 }
 
-u8* SWRenderer::GetCurrentColorTexture()
+std::unique_ptr<AbstractShader> SWRenderer::CreateShaderFromBinary(ShaderStage stage,
+                                                                   const void* data, size_t length)
 {
-  return s_xfbColorTexture[s_currentColorTexture];
+  return std::make_unique<SWShader>(stage);
 }
 
-void SWRenderer::SwapColorTexture()
+class SWPipeline final : public AbstractPipeline
 {
-  s_currentColorTexture = !s_currentColorTexture;
-}
+public:
+  SWPipeline() : AbstractPipeline() {}
+  ~SWPipeline() override = default;
+};
 
-void SWRenderer::UpdateColorTexture(EfbInterface::yuv422_packed* xfb, u32 fbWidth, u32 fbHeight)
+std::unique_ptr<AbstractPipeline> SWRenderer::CreatePipeline(const AbstractPipelineConfig& config)
 {
-  if (fbWidth * fbHeight > MAX_XFB_WIDTH * MAX_XFB_HEIGHT)
-  {
-    ERROR_LOG(VIDEO, "Framebuffer is too large: %ix%i", fbWidth, fbHeight);
-    return;
-  }
-
-  u32 offset = 0;
-  u8* TexturePointer = GetNextColorTexture();
-
-  for (u16 y = 0; y < fbHeight; y++)
-  {
-    for (u16 x = 0; x < fbWidth; x += 2)
-    {
-      // We do this one color sample (aka 2 RGB pixles) at a time
-      int Y1 = xfb[x].Y - 16;
-      int Y2 = xfb[x + 1].Y - 16;
-      int U = int(xfb[x].UV) - 128;
-      int V = int(xfb[x + 1].UV) - 128;
-
-      // We do the inverse BT.601 conversion for YCbCr to RGB
-      // http://www.equasys.de/colorconversion.html#YCbCr-RGBColorFormatConversion
-      TexturePointer[offset++] = MathUtil::Clamp(int(1.164f * Y1 + 1.596f * V), 0, 255);
-      TexturePointer[offset++] =
-          MathUtil::Clamp(int(1.164f * Y1 - 0.392f * U - 0.813f * V), 0, 255);
-      TexturePointer[offset++] = MathUtil::Clamp(int(1.164f * Y1 + 2.017f * U), 0, 255);
-      TexturePointer[offset++] = 255;
-
-      TexturePointer[offset++] = MathUtil::Clamp(int(1.164f * Y2 + 1.596f * V), 0, 255);
-      TexturePointer[offset++] =
-          MathUtil::Clamp(int(1.164f * Y2 - 0.392f * U - 0.813f * V), 0, 255);
-      TexturePointer[offset++] = MathUtil::Clamp(int(1.164f * Y2 + 2.017f * U), 0, 255);
-      TexturePointer[offset++] = 255;
-    }
-    xfb += fbWidth;
-  }
-  SwapColorTexture();
+  return std::make_unique<SWPipeline>();
 }
 
 // Called on the GPU thread
-void SWRenderer::SwapImpl(u32 xfbAddr, u32 fbWidth, u32 fbStride, u32 fbHeight,
-                          const EFBRectangle& rc, float Gamma)
+void SWRenderer::SwapImpl(AbstractTexture* texture, const EFBRectangle& xfb_region, u64 ticks)
 {
-  if (!Fifo::WillSkipCurrentFrame())
-  {
-    if (g_ActiveConfig.bUseXFB)
-    {
-      EfbInterface::yuv422_packed* xfb = (EfbInterface::yuv422_packed*)Memory::GetPointer(xfbAddr);
-      UpdateColorTexture(xfb, fbWidth, fbHeight);
-    }
-    else
-    {
-      EfbInterface::BypassXFB(GetCurrentColorTexture(), fbWidth, fbHeight, rc, Gamma);
-    }
-
-    // Save screenshot
-    if (s_bScreenshot)
-    {
-      std::lock_guard<std::mutex> lk(s_criticalScreenshot);
-
-      if (TextureToPng(GetCurrentColorTexture(), fbWidth * 4, s_sScreenshotName, fbWidth, fbHeight,
-                       false))
-        OSD::AddMessage("Screenshot saved to " + s_sScreenshotName);
-
-      // Reset settings
-      s_sScreenshotName.clear();
-      s_bScreenshot = false;
-      s_screenshotCompleted.Set();
-    }
-
-    if (SConfig::GetInstance().m_DumpFrames)
-    {
-      static int frame_index = 0;
-      TextureToPng(GetCurrentColorTexture(), fbWidth * 4,
-                   StringFromFormat("%sframe%i_color.png",
-                                    File::GetUserPath(D_DUMPFRAMES_IDX).c_str(), frame_index),
-                   fbWidth, fbHeight, true);
-      frame_index++;
-    }
-  }
-
   OSD::DoCallbacks(OSD::CallbackType::OnFrame);
 
-  DrawDebugText();
-
-  SWOGLWindow::s_instance->ShowImage(GetCurrentColorTexture(), fbWidth * 4, fbWidth, fbHeight, 1.0);
+  if (!IsHeadless())
+  {
+    DrawDebugText();
+    m_window->ShowImage(texture, xfb_region);
+  }
 
   UpdateActiveConfig();
-
-  // virtual XFB is not supported
-  if (g_ActiveConfig.bUseXFB)
-    g_ActiveConfig.bUseRealXFB = true;
 }
 
 u32 SWRenderer::AccessEFB(EFBAccessType type, u32 x, u32 y, u32 InputData)
@@ -169,15 +113,14 @@ u32 SWRenderer::AccessEFB(EFBAccessType type, u32 x, u32 y, u32 InputData)
 
   switch (type)
   {
-  case PEEK_Z:
+  case EFBAccessType::PeekZ:
   {
     value = EfbInterface::GetDepth(x, y);
     break;
   }
-  case PEEK_COLOR:
+  case EFBAccessType::PeekColor:
   {
-    u32 color = 0;
-    EfbInterface::GetColor(x, y, (u8*)&color);
+    const u32 color = EfbInterface::GetColor(x, y);
 
     // rgba to argb
     value = (color >> 8) | (color & 0xff) << 24;

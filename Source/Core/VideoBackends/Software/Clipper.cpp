@@ -36,7 +36,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include "VideoBackends/Software/Clipper.h"
-#include "Common/ChunkFile.h"
+
+#include "Common/Assert.h"
+
 #include "VideoBackends/Software/NativeVertexFormat.h"
 #include "VideoBackends/Software/Rasterizer.h"
 
@@ -72,7 +74,7 @@ enum
   CLIP_NEG_Z_BIT = 0x20
 };
 
-static inline int CalcClipMask(OutputVertexData* v)
+static inline int CalcClipMask(const OutputVertexData* v)
 {
   int cmask = 0;
   Vec4 pos = v->projectedPosition;
@@ -316,7 +318,7 @@ void ProcessTriangle(OutputVertexData* v0, OutputVertexData* v1, OutputVertexDat
 
   for (int i = 0; i + 3 <= numIndices; i += 3)
   {
-    _assert_(i < NUM_INDICES);
+    ASSERT(i < NUM_INDICES);
     if (indices[i] != SKIP_FLAG)
     {
       PerspectiveDivide(Vertices[indices[i]]);
@@ -329,22 +331,18 @@ void ProcessTriangle(OutputVertexData* v0, OutputVertexData* v1, OutputVertexDat
   }
 }
 
-static void CopyVertex(OutputVertexData* dst, OutputVertexData* src, float dx, float dy,
+static void CopyVertex(OutputVertexData* dst, const OutputVertexData* src, float dx, float dy,
                        unsigned int sOffset)
 {
   dst->screenPosition.x = src->screenPosition.x + dx;
   dst->screenPosition.y = src->screenPosition.y + dy;
   dst->screenPosition.z = src->screenPosition.z;
 
-  for (int i = 0; i < 3; ++i)
-    dst->normal[i] = src->normal[i];
-
-  for (int i = 0; i < 4; ++i)
-    dst->color[0][i] = src->color[0][i];
+  dst->normal = src->normal;
+  dst->color = src->color;
 
   // todo - s offset
-  for (int i = 0; i < 8; ++i)
-    dst->texCoords[i] = src->texCoords[i];
+  dst->texCoords = src->texCoords;
 }
 
 void ProcessLine(OutputVertexData* lineV0, OutputVertexData* lineV1)
@@ -403,7 +401,8 @@ void ProcessLine(OutputVertexData* lineV0, OutputVertexData* lineV1)
   }
 }
 
-bool CullTest(OutputVertexData* v0, OutputVertexData* v1, OutputVertexData* v2, bool& backface)
+bool CullTest(const OutputVertexData* v0, const OutputVertexData* v1, const OutputVertexData* v2,
+              bool& backface)
 {
   int mask = CalcClipMask(v0);
   mask &= CalcClipMask(v1);

@@ -4,44 +4,10 @@
 
 #pragma once
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <string>
-
-// Git version number
-extern const std::string scm_desc_str;
-extern const std::string scm_branch_str;
-extern const std::string scm_rev_str;
-extern const std::string scm_rev_git_str;
-extern const std::string netplay_dolphin_ver;
-extern const std::string scm_distributor_str;
-
-// Force enable logging in the right modes. For some reason, something had changed
-// so that debugfast no longer logged.
-#if defined(_DEBUG) || defined(DEBUGFAST)
-#undef LOGGING
-#define LOGGING 1
-#endif
-
-#if defined(__GNUC__) || __clang__
-// Disable "unused function" warnings for the ones manually marked as such.
-#define UNUSED __attribute__((unused))
-#else
-// Not sure MSVC even checks this...
-#define UNUSED
-#endif
-
 #if defined _WIN32
 
 // Memory leak checks
 #define CHECK_HEAP_INTEGRITY()
-
-// Since they are always around on Windows
-#define HAVE_WX 1
-#define HAVE_OPENAL 1
-
-#define HAVE_PORTAUDIO 1
 
 // Debug definitions
 #if defined(_DEBUG)
@@ -68,8 +34,6 @@ struct CrtDebugBreak
 #ifndef _WIN32
 #include <limits.h>
 #define MAX_PATH PATH_MAX
-
-#define __forceinline inline __attribute__((always_inline))
 #endif
 
 #ifdef _MSC_VER
@@ -81,23 +45,4 @@ struct CrtDebugBreak
 #endif
 
 // Dummy macro for marking translatable strings that can not be immediately translated.
-// wxWidgets does not have a true dummy macro for this.
 #define _trans(a) a
-
-// Host communication.
-enum HOST_COMM
-{
-  // Begin at 10 in case there is already messages with wParam = 0, 1, 2 and so on
-  WM_USER_STOP = 10,
-  WM_USER_CREATE,
-  WM_USER_SETCURSOR,
-  WM_USER_JOB_DISPATCH,
-};
-
-// Used for notification on emulation state
-enum EMUSTATE_CHANGE
-{
-  EMUSTATE_CHANGE_PLAY = 1,
-  EMUSTATE_CHANGE_PAUSE,
-  EMUSTATE_CHANGE_STOP
-};

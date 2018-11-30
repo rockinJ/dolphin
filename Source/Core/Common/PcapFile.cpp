@@ -5,9 +5,11 @@
 #include <chrono>
 
 #include "Common/CommonTypes.h"
-#include "Common/FileUtil.h"
+#include "Common/File.h"
 #include "Common/PcapFile.h"
 
+namespace Common
+{
 namespace
 {
 const u32 PCAP_MAGIC = 0xa1b2c3d4;
@@ -61,3 +63,4 @@ void PCAP::AddPacket(const u8* bytes, size_t size)
   m_fp->WriteBytes(&rec_hdr, sizeof(rec_hdr));
   m_fp->WriteBytes(bytes, size);
 }
+}  // namespace Common

@@ -2,15 +2,22 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include <cstring>
 #include <fcntl.h>
 #include <libudev.h>
 #include <map>
+#include <memory>
+#include <string>
 #include <unistd.h>
 
+#include <sys/eventfd.h>
+
 #include "Common/Assert.h"
+#include "Common/Flag.h"
 #include "Common/Logging/Log.h"
 #include "Common/MathUtil.h"
 #include "Common/StringUtil.h"
+#include "Common/Thread.h"
 #include "InputCommon/ControllerInterface/ControllerInterface.h"
 #include "InputCommon/ControllerInterface/evdev/evdev.h"
 
@@ -18,30 +25,114 @@ namespace ciface
 {
 namespace evdev
 {
-static std::string GetName(const std::string& devnode)
+static std::thread s_hotplug_thread;
+static Common::Flag s_hotplug_thread_running;
+static int s_wakeup_eventfd;
+
+// There is no easy way to get the device name from only a dev node
+// during a device removed event, since libevdev can't work on removed devices;
+// sysfs is not stable, so this is probably the easiest way to get a name for a node.
+static std::map<std::string, std::string> s_devnode_name_map;
+
+static void HotplugThreadFunc()
 {
-  int fd = open(devnode.c_str(), O_RDWR | O_NONBLOCK);
-  libevdev* dev = nullptr;
-  int ret = libevdev_new_from_fd(fd, &dev);
-  if (ret != 0)
+  Common::SetCurrentThreadName("evdev Hotplug Thread");
+  NOTICE_LOG(SERIALINTERFACE, "evdev hotplug thread started");
+
+  udev* udev = udev_new();
+  ASSERT_MSG(PAD, udev != nullptr, "Couldn't initialize libudev.");
+
+  // Set up monitoring
+  udev_monitor* monitor = udev_monitor_new_from_netlink(udev, "udev");
+  udev_monitor_filter_add_match_subsystem_devtype(monitor, "input", nullptr);
+  udev_monitor_enable_receiving(monitor);
+  const int monitor_fd = udev_monitor_get_fd(monitor);
+
+  while (s_hotplug_thread_running.IsSet())
   {
-    close(fd);
-    return std::string();
+    fd_set fds;
+
+    FD_ZERO(&fds);
+    FD_SET(monitor_fd, &fds);
+    FD_SET(s_wakeup_eventfd, &fds);
+
+    int ret = select(std::max(monitor_fd, s_wakeup_eventfd) + 1, &fds, nullptr, nullptr, nullptr);
+    if (ret < 1 || !FD_ISSET(monitor_fd, &fds))
+      continue;
+
+    std::unique_ptr<udev_device, decltype(&udev_device_unref)> dev{
+        udev_monitor_receive_device(monitor), udev_device_unref};
+
+    const char* action = udev_device_get_action(dev.get());
+    const char* devnode = udev_device_get_devnode(dev.get());
+    if (!devnode)
+      continue;
+
+    if (strcmp(action, "remove") == 0)
+    {
+      const auto it = s_devnode_name_map.find(devnode);
+      if (it == s_devnode_name_map.end())
+        continue;  // we don't know the name for this device, so it is probably not an evdev device
+      const std::string& name = it->second;
+      g_controller_interface.RemoveDevice([&name](const auto& device) {
+        return device->GetSource() == "evdev" && device->GetName() == name && !device->IsValid();
+      });
+      s_devnode_name_map.erase(devnode);
+    }
+    else if (strcmp(action, "add") == 0)
+    {
+      auto device = std::make_shared<evdevDevice>(devnode);
+      if (device->IsInteresting())
+      {
+        s_devnode_name_map.emplace(devnode, device->GetName());
+        g_controller_interface.AddDevice(std::move(device));
+      }
+    }
   }
-  std::string res = libevdev_get_name(dev);
-  libevdev_free(dev);
-  close(fd);
-  return res;
+  NOTICE_LOG(SERIALINTERFACE, "evdev hotplug thread stopped");
+}
+
+static void StartHotplugThread()
+{
+  // Mark the thread as running.
+  if (!s_hotplug_thread_running.TestAndSet())
+    // It was already running.
+    return;
+
+  s_wakeup_eventfd = eventfd(0, 0);
+  ASSERT_MSG(PAD, s_wakeup_eventfd != -1, "Couldn't create eventfd.");
+  s_hotplug_thread = std::thread(HotplugThreadFunc);
+}
+
+static void StopHotplugThread()
+{
+  // Tell the hotplug thread to stop.
+  if (!s_hotplug_thread_running.TestAndClear())
+    // It wasn't running, we're done.
+    return;
+  // Write something to efd so that select() stops blocking.
+  uint64_t value = 1;
+  if (write(s_wakeup_eventfd, &value, sizeof(uint64_t)) < 0)
+  {
+  }
+  s_hotplug_thread.join();
+  close(s_wakeup_eventfd);
 }
 
 void Init()
 {
-  // We use Udev to find any devices. In the future this will allow for hotplugging.
-  // But for now it is essentially iterating over /dev/input/event0 to event31. However if the
-  // naming scheme is ever updated in the future, this *should* be forwards compatable.
+  s_devnode_name_map.clear();
+  StartHotplugThread();
+}
 
-  struct udev* udev = udev_new();
-  _assert_msg_(PAD, udev != 0, "Couldn't initilize libudev.");
+void PopulateDevices()
+{
+  // We use udev to iterate over all /dev/input/event* devices.
+  // Note: the Linux kernel is currently limited to just 32 event devices. If
+  // this ever changes, hopefully udev will take care of this.
+
+  udev* udev = udev_new();
+  ASSERT_MSG(PAD, udev != nullptr, "Couldn't initialize libudev.");
 
   // List all input devices
   udev_enumerate* enumerate = udev_enumerate_new(udev);
@@ -58,16 +149,15 @@ void Init()
     udev_device* dev = udev_device_new_from_syspath(udev, path);
 
     const char* devnode = udev_device_get_devnode(dev);
-    // We only care about devices which we have read/write access to.
-    if (devnode && access(devnode, W_OK) == 0)
+    if (devnode)
     {
       // Unfortunately udev gives us no way to filter out the non event device interfaces.
       // So we open it and see if it works with evdev ioctls or not.
-      std::string name = GetName(devnode);
       auto input = std::make_shared<evdevDevice>(devnode);
 
       if (input->IsInteresting())
       {
+        s_devnode_name_map.emplace(devnode, input->GetName());
         g_controller_interface.AddDevice(std::move(input));
       }
     }
@@ -77,10 +167,21 @@ void Init()
   udev_unref(udev);
 }
 
+void Shutdown()
+{
+  StopHotplugThread();
+}
+
 evdevDevice::evdevDevice(const std::string& devnode) : m_devfile(devnode)
 {
   // The device file will be read on one of the main threads, so we open in non-blocking mode.
   m_fd = open(devnode.c_str(), O_RDWR | O_NONBLOCK);
+  if (m_fd == -1)
+  {
+    m_initialized = false;
+    return;
+  }
+
   int ret = libevdev_new_from_fd(m_fd, &m_dev);
 
   if (ret != 0)
@@ -152,6 +253,22 @@ void evdevDevice::UpdateInput()
   } while (rc >= 0);
 }
 
+bool evdevDevice::IsValid() const
+{
+  int current_fd = libevdev_get_fd(m_dev);
+  if (current_fd == -1)
+    return false;
+
+  libevdev* device;
+  if (libevdev_new_from_fd(current_fd, &device) != 0)
+  {
+    close(current_fd);
+    return false;
+  }
+  libevdev_free(device);
+  return true;
+}
+
 std::string evdevDevice::Button::GetName() const
 {
   // Buttons below 0x100 are mostly keyboard keys, and the names make sense
@@ -177,7 +294,7 @@ evdevDevice::Axis::Axis(u8 index, u16 code, bool upper, libevdev* dev)
     : m_code(code), m_index(index), m_upper(upper), m_dev(dev)
 {
   m_min = libevdev_get_abs_minimum(m_dev, m_code);
-  m_range = libevdev_get_abs_maximum(m_dev, m_code) + abs(m_min);
+  m_range = libevdev_get_abs_maximum(m_dev, m_code) - m_min;
 }
 
 std::string evdevDevice::Axis::GetName() const
@@ -276,7 +393,9 @@ void evdevDevice::ForceFeedback::SetState(ControlState state)
     play.code = m_id;
     play.value = 1;
 
-    write(m_fd, (const void*)&play, sizeof(play));
+    if (write(m_fd, &play, sizeof(play)) < 0)
+    {
+    }
   }
 }
 

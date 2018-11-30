@@ -4,13 +4,11 @@
 
 // Originally written by Sven Peter <sven@fail0verflow.com> for anergistic.
 
-#include <fcntl.h>
-#include <stdarg.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #ifdef _WIN32
-#include <iphlpapi.h>
 #include <iphlpapi.h>
 #include <ws2tcpip.h>
 #else
@@ -20,8 +18,14 @@
 #include <sys/un.h>
 #endif
 
+#include "Common/Logging/Log.h"
+#include "Core/HW/CPU.h"
+#include "Core/HW/Memmap.h"
 #include "Core/Host.h"
 #include "Core/PowerPC/GDBStub.h"
+#include "Core/PowerPC/Gekko.h"
+#include "Core/PowerPC/PPCCache.h"
+#include "Core/PowerPC/PowerPC.h"
 
 #define GDB_BFR_MAX 10000
 #define GDB_MAX_BP 10
@@ -63,7 +67,7 @@ static u8 hex2char(u8 hex)
   else if (hex >= 'A' && hex <= 'F')
     return hex - 'A' + 0xa;
 
-  ERROR_LOG(GDB_STUB, "Invalid nibble: %c (%02x)\n", hex, hex);
+  ERROR_LOG(GDB_STUB, "Invalid nibble: %c (%02x)", hex, hex);
   return 0;
 }
 
@@ -186,7 +190,7 @@ static void gdb_bp_remove(u32 type, u32 addr, u32 len)
     p = gdb_bp_find(type, addr, len);
     if (p != nullptr)
     {
-      DEBUG_LOG(GDB_STUB, "gdb: removed a breakpoint: %08x bytes at %08x\n", len, addr);
+      DEBUG_LOG(GDB_STUB, "gdb: removed a breakpoint: %08x bytes at %08x", len, addr);
       p->active = 0;
       memset(p, 0, sizeof(gdb_bp_t));
     }
@@ -248,12 +252,12 @@ static void gdb_read_command()
   else if (c == 0x03)
   {
     CPU::Break();
-    gdb_signal(SIGTRAP);
+    gdb_signal(GDB_SIGTRAP);
     return;
   }
   else if (c != GDB_STUB_START)
   {
-    DEBUG_LOG(GDB_STUB, "gdb: read invalid byte %02x\n", c);
+    DEBUG_LOG(GDB_STUB, "gdb: read invalid byte %02x", c);
     return;
   }
 
@@ -262,7 +266,7 @@ static void gdb_read_command()
     cmd_bfr[cmd_len++] = c;
     if (cmd_len == sizeof cmd_bfr)
     {
-      ERROR_LOG(GDB_STUB, "gdb: cmd_bfr overflow\n");
+      ERROR_LOG(GDB_STUB, "gdb: cmd_bfr overflow");
       gdb_nak();
       return;
     }
@@ -276,7 +280,7 @@ static void gdb_read_command()
   if (chk_calc != chk_read)
   {
     ERROR_LOG(GDB_STUB,
-              "gdb: invalid checksum: calculated %02x and read %02x for $%s# (length: %d)\n",
+              "gdb: invalid checksum: calculated %02x and read %02x for $%s# (length: %d)",
               chk_calc, chk_read, cmd_bfr, cmd_len);
     cmd_len = 0;
 
@@ -284,8 +288,7 @@ static void gdb_read_command()
     return;
   }
 
-  DEBUG_LOG(GDB_STUB, "gdb: read command %c with a length of %d: %s\n", cmd_bfr[0], cmd_len,
-            cmd_bfr);
+  DEBUG_LOG(GDB_STUB, "gdb: read command %c with a length of %d: %s", cmd_bfr[0], cmd_len, cmd_bfr);
   gdb_ack();
 }
 
@@ -337,7 +340,7 @@ static void gdb_reply(const char* reply)
   cmd_bfr[cmd_len + 2] = nibble2hex(chk >> 4);
   cmd_bfr[cmd_len + 3] = nibble2hex(chk);
 
-  DEBUG_LOG(GDB_STUB, "gdb: reply (len: %d): %s\n", cmd_len, cmd_bfr);
+  DEBUG_LOG(GDB_STUB, "gdb: reply (len: %d): %s", cmd_len, cmd_bfr);
 
   ptr = cmd_bfr;
   left = cmd_len + 4;
@@ -356,7 +359,7 @@ static void gdb_reply(const char* reply)
 
 static void gdb_handle_query()
 {
-  DEBUG_LOG(GDB_STUB, "gdb: query '%s'\n", cmd_bfr + 1);
+  DEBUG_LOG(GDB_STUB, "gdb: query '%s'", cmd_bfr + 1);
 
   if (!strcmp((const char*)(cmd_bfr + 1), "TStatus"))
   {
@@ -443,10 +446,10 @@ static void gdb_read_register()
     wbe32hex(reply, PC);
     break;
   case 65:
-    wbe32hex(reply, MSR);
+    wbe32hex(reply, MSR.Hex);
     break;
   case 66:
-    wbe32hex(reply, GetCR());
+    wbe32hex(reply, PowerPC::GetCR());
     break;
   case 67:
     wbe32hex(reply, LR);
@@ -484,24 +487,6 @@ static void gdb_read_registers()
     wbe32hex(bufptr + i * 8, GPR(i));
   }
   bufptr += 32 * 8;
-
-  /*
-  for (i = 0; i < 32; i++)
-  {
-    wbe32hex(bufptr + i*8, riPS0(i));
-  }
-  bufptr += 32 * 8;
-  wbe32hex(bufptr, PC);      bufptr += 4;
-  wbe32hex(bufptr, MSR);     bufptr += 4;
-  wbe32hex(bufptr, GetCR()); bufptr += 4;
-  wbe32hex(bufptr, LR);      bufptr += 4;
-
-
-  wbe32hex(bufptr, CTR);     bufptr += 4;
-  wbe32hex(bufptr, PowerPC::ppcState.spr[SPR_XER]); bufptr += 4;
-  // MQ register not used.
-  wbe32hex(bufptr, 0x0BADC0DE); bufptr += 4;
-  */
 
   gdb_reply((char*)bfr);
 }
@@ -546,10 +531,10 @@ static void gdb_write_register()
     PC = re32hex(bufptr);
     break;
   case 65:
-    MSR = re32hex(bufptr);
+    MSR.Hex = re32hex(bufptr);
     break;
   case 66:
-    SetCR(re32hex(bufptr));
+    PowerPC::SetCR(re32hex(bufptr));
     break;
   case 67:
     LR = re32hex(bufptr);
@@ -589,7 +574,7 @@ static void gdb_read_mem()
   len = 0;
   while (i < cmd_len)
     len = (len << 4) | hex2char(cmd_bfr[i++]);
-  DEBUG_LOG(GDB_STUB, "gdb: read memory: %08x bytes from %08x\n", len, addr);
+  DEBUG_LOG(GDB_STUB, "gdb: read memory: %08x bytes from %08x", len, addr);
 
   if (len * 2 > sizeof reply)
     gdb_reply("E01");
@@ -615,7 +600,7 @@ static void gdb_write_mem()
   len = 0;
   while (cmd_bfr[i] != ':')
     len = (len << 4) | hex2char(cmd_bfr[i++]);
-  DEBUG_LOG(GDB_STUB, "gdb: write memory: %08x bytes to %08x\n", len, addr);
+  DEBUG_LOG(GDB_STUB, "gdb: write memory: %08x bytes to %08x", len, addr);
 
   u8* dst = Memory::GetPointer(addr);
   if (!dst)
@@ -652,7 +637,7 @@ bool gdb_add_bp(u32 type, u32 addr, u32 len)
   bp->addr = addr;
   bp->len = len;
 
-  DEBUG_LOG(GDB_STUB, "gdb: added %d breakpoint: %08x bytes at %08x\n", type, bp->len, bp->addr);
+  DEBUG_LOG(GDB_STUB, "gdb: added %d breakpoint: %08x bytes at %08x", type, bp->len, bp->addr);
   return true;
 }
 
@@ -835,12 +820,6 @@ void gdb_init(u32 port)
                    (sockaddr*)&saddr_client, &client_addrlen);
 
   saddr_client.sin_addr.s_addr = ntohl(saddr_client.sin_addr.s_addr);
-  /*if (((saddr_client.sin_addr.s_addr >> 24) & 0xff) != 127 ||
-  *      ((saddr_client.sin_addr.s_addr >> 16) & 0xff) !=   0 ||
-  *      ((saddr_client.sin_addr.s_addr >>  8) & 0xff) !=   0 ||
-  *      ((saddr_client.sin_addr.s_addr >>  0) & 0xff) !=   1)
-  *      ERROR_LOG(GDB_STUB, "gdb: incoming connection not from localhost");
-  */
 }
 
 static void gdb_init_generic(int domain, const sockaddr* server_addr, socklen_t server_addrlen,
@@ -870,12 +849,12 @@ static void gdb_init_generic(int domain, const sockaddr* server_addr, socklen_t 
   if (listen(tmpsock, 1) < 0)
     ERROR_LOG(GDB_STUB, "Failed to listen to gdb socket");
 
-  INFO_LOG(GDB_STUB, "Waiting for gdb to connect...\n");
+  INFO_LOG(GDB_STUB, "Waiting for gdb to connect...");
 
   sock = accept(tmpsock, client_addr, client_addrlen);
   if (sock < 0)
     ERROR_LOG(GDB_STUB, "Failed to accept gdb client");
-  INFO_LOG(GDB_STUB, "Client connected.\n");
+  INFO_LOG(GDB_STUB, "Client connected.");
 
   close(tmpsock);
   tmpsock = -1;

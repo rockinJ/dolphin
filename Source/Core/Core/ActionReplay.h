@@ -19,6 +19,10 @@ struct AREntry
   u32 cmd_addr;
   u32 value;
 };
+constexpr bool operator==(const AREntry& left, const AREntry& right)
+{
+  return left.cmd_addr == right.cmd_addr && left.value == right.value;
+}
 
 struct ARCode
 {
@@ -31,6 +35,9 @@ struct ARCode
 void RunAllActive();
 
 void ApplyCodes(const std::vector<ARCode>& codes);
+void SetSyncedCodesAsActive();
+void UpdateSyncedCodes(const std::vector<ARCode>& codes);
+std::vector<ARCode> ApplyAndReturnCodes(const std::vector<ARCode>& codes);
 void AddCode(ARCode new_code);
 void LoadAndApplyCodes(const IniFile& global_ini, const IniFile& local_ini);
 

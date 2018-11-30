@@ -12,11 +12,12 @@
 
 #include "Common/CommonTypes.h"
 
+namespace Common
+{
 // This class lets you create a block of anonymous RAM, and then arbitrarily map views into it.
 // Multiple views can mirror the same section of the block, which makes it very convenient for
 // emulating
 // memory mirrors.
-
 class MemArena
 {
 public:
@@ -36,25 +37,4 @@ private:
 #endif
 };
 
-enum
-{
-  MV_MIRROR_PREVIOUS = 1,
-  MV_FAKE_VMEM = 2,
-  MV_WII_ONLY = 4,
-};
-
-struct MemoryView
-{
-  u8** out_ptr;
-  u64 virtual_address;
-  u32 size;
-  u32 flags;
-  void* mapped_ptr;
-  void* view_ptr;
-  u32 shm_position;
-};
-
-// Uses a memory arena to set up an emulator-friendly memory map according to
-// a passed-in list of MemoryView structures.
-u8* MemoryMap_Setup(MemoryView* views, int num_views, u32 flags, MemArena* arena);
-void MemoryMap_Shutdown(MemoryView* views, int num_views, u32 flags, MemArena* arena);
+}  // namespace Common

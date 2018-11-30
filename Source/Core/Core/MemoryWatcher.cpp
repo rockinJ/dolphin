@@ -15,13 +15,13 @@
 #include "Core/MemoryWatcher.h"
 
 static std::unique_ptr<MemoryWatcher> s_memory_watcher;
-static int s_event;
+static CoreTiming::EventType* s_event;
 static const int MW_RATE = 600;  // Steps per second
 
 static void MWCallback(u64 userdata, s64 cyclesLate)
 {
   s_memory_watcher->Step();
-  CoreTiming::ScheduleEvent((SystemTimers::GetTicksPerSecond() / MW_RATE) - cyclesLate, s_event);
+  CoreTiming::ScheduleEvent(SystemTimers::GetTicksPerSecond() / MW_RATE - cyclesLate, s_event);
 }
 
 void MemoryWatcher::Init()
@@ -58,7 +58,8 @@ MemoryWatcher::~MemoryWatcher()
 
 bool MemoryWatcher::LoadAddresses(const std::string& path)
 {
-  std::ifstream locations(path);
+  std::ifstream locations;
+  File::OpenFStream(locations, path, std::ios_base::in);
   if (!locations)
     return false;
 

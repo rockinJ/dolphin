@@ -2,32 +2,182 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include "VideoBackends/OGL/FramebufferManager.h"
+
 #include <memory>
 #include <vector>
 
 #include "Common/Common.h"
-#include "Common/CommonFuncs.h"
-#include "Common/GL/GLInterfaceBase.h"
+#include "Common/CommonTypes.h"
+#include "Common/Logging/Log.h"
+#include "Common/MsgHandler.h"
+
 #include "Core/HW/Memmap.h"
 
-#include "VideoBackends/OGL/FramebufferManager.h"
 #include "VideoBackends/OGL/Render.h"
 #include "VideoBackends/OGL/SamplerCache.h"
 #include "VideoBackends/OGL/TextureConverter.h"
+#include "VideoBackends/OGL/VertexManager.h"
 
-#include "VideoCommon/DriverDetails.h"
 #include "VideoCommon/OnScreenDisplay.h"
 #include "VideoCommon/VertexShaderGen.h"
+#include "VideoCommon/VideoBackendBase.h"
+
+constexpr const char* GLSL_REINTERPRET_PIXELFMT_VS = R"GLSL(
+flat out int layer;
+void main(void) {
+  layer = 0;
+  vec2 rawpos = vec2(gl_VertexID & 1, gl_VertexID & 2);
+  gl_Position = vec4(rawpos* 2.0 - 1.0, 0.0, 1.0);
+})GLSL";
+
+constexpr const char* GLSL_SHADER_FS = R"GLSL(
+#define MULTILAYER %d
+#define MSAA %d
+
+#if MSAA
+
+#if MULTILAYER
+SAMPLER_BINDING(9) uniform sampler2DMSArray samp9;
+#else
+SAMPLER_BINDING(9) uniform sampler2DMS samp9;
+#endif
+
+#else
+SAMPLER_BINDING(9) uniform sampler2DArray samp9;
+#endif
+
+vec4 sampleEFB(ivec3 pos) {
+#if MSAA
+
+#if MULTILAYER
+  return texelFetch(samp9, pos, gl_SampleID);
+#else
+  return texelFetch(samp9, pos.xy, gl_SampleID);
+#endif
+
+#else
+  return texelFetch(samp9, pos, 0);
+#endif
+})GLSL";
+
+constexpr const char* GLSL_SAMPLE_EFB_FS = R"GLSL(
+#define MULTILAYER %d
+
+#if MULTILAYER
+SAMPLER_BINDING(9) uniform sampler2DMSArray samp9;
+#else
+SAMPLER_BINDING(9) uniform sampler2DMS samp9;
+#endif
+vec4 sampleEFB(ivec3 pos) {
+  vec4 color = vec4(0.0, 0.0, 0.0, 0.0);
+  for (int i = 0; i < %d; i++)
+#if MULTILAYER
+    color += texelFetch(samp9, pos, i);
+#else
+    color += texelFetch(samp9, pos.xy, i);
+#endif
+
+  return color / %d;
+})GLSL";
+
+constexpr const char* GLSL_RGBA6_TO_RGB8_FS = R"GLSL(
+flat in int layer;
+out vec4 ocol0;
+void main() {
+  ivec4 src6 = ivec4(round(sampleEFB(ivec3(gl_FragCoord.xy, layer)) * 63.f));
+  ivec4 dst8;
+
+  dst8.r = (src6.r << 2) | (src6.g >> 4);
+  dst8.g = ((src6.g & 0xF) << 4) | (src6.b >> 2);
+  dst8.b = ((src6.b & 0x3) << 6) | src6.a;
+  dst8.a = 255;
+
+  ocol0 = float4(dst8) / 255.f;
+})GLSL";
+
+constexpr const char* GLSL_RGB8_TO_RGBA6_FS = R"GLSL(
+flat in int layer;
+out vec4 ocol0;
+void main() {
+  ivec4 src8 = ivec4(round(sampleEFB(ivec3(gl_FragCoord.xy, layer)) * 255.f));
+  ivec4 dst6;
+
+  dst6.r = src8.r >> 2;
+  dst6.g = ((src8.r & 0x3) << 4) | (src8.g >> 4);
+  dst6.b = ((src8.g & 0xF) << 2) | (src8.b >> 6);
+  dst6.a = src8.b & 0x3F;
+  ocol0 = float4(dst6) / 63.f;
+})GLSL";
+
+constexpr const char* GLSL_GS = R"GLSL(
+layout(triangles) in;
+layout(triangle_strip, max_vertices = %d) out;
+flat out int layer;
+void main() {
+  for (int j = 0; j < %d; ++j) {
+    for (int i = 0; i < 3; ++i) {
+      layer = j;
+      gl_Layer = j;
+      gl_Position = gl_in[i].gl_Position;
+      EmitVertex();
+    }
+    EndPrimitive();
+  }
+})GLSL";
+
+constexpr const char* GLSL_EFB_POKE_VERTEX_VS = R"GLSL(
+in vec2 rawpos;
+in vec4 rawcolor0; // color
+in int rawcolor1;  // depth
+out vec4 v_c;
+out float v_z;
+void main(void) {
+  gl_Position = vec4(((rawpos + 0.5) / vec2(640.0, 528.0) * 2.0 - 1.0) * vec2(1.0, -1.0), 0.0, 1.0);
+  gl_PointSize = %d.0 / 640.0;
+
+  v_c = rawcolor0.bgra;
+  v_z = float(rawcolor1 & 0xFFFFFF) / 16777216.0;
+})GLSL";
+
+constexpr const char* GLSL_EFB_POKE_PIXEL_FS = R"GLSL(
+in vec4 %s_c;
+in float %s_z;
+out vec4 ocol0;
+void main(void) {
+  ocol0 = %s_c;
+  gl_FragDepth = %s_z;
+})GLSL";
+
+constexpr const char* GLSL_EFB_POKE_GEOMETRY_GS = R"GLSL(
+layout(points) in;
+layout(points, max_vertices = %d) out;
+in vec4 v_c[1];
+in float v_z[1];
+out vec4 g_c;
+out float g_z;
+void main() {
+  for (int j = 0; j < %d; ++j) {
+    gl_Layer = j;
+    gl_Position = gl_in[0].gl_Position;
+    gl_PointSize = %d.0 / 640.0;
+    g_c = v_c[0];
+    g_z = v_z[0];
+
+    EmitVertex();
+    EndPrimitive();
+  }
+})GLSL";
 
 namespace OGL
 {
 int FramebufferManager::m_targetWidth;
 int FramebufferManager::m_targetHeight;
 int FramebufferManager::m_msaaSamples;
+bool FramebufferManager::m_enable_stencil_buffer;
 
 GLenum FramebufferManager::m_textureType;
 std::vector<GLuint> FramebufferManager::m_efbFramebuffer;
-GLuint FramebufferManager::m_xfbFramebuffer;
 GLuint FramebufferManager::m_efbColor;
 GLuint FramebufferManager::m_efbDepth;
 GLuint FramebufferManager::m_efbColorSwap;  // for hot swap when reinterpreting EFB pixel formats
@@ -45,9 +195,66 @@ GLuint FramebufferManager::m_EfbPokes_VBO;
 GLuint FramebufferManager::m_EfbPokes_VAO;
 SHADER FramebufferManager::m_EfbPokes;
 
-FramebufferManager::FramebufferManager(int targetWidth, int targetHeight, int msaaSamples)
+GLuint FramebufferManager::CreateTexture(GLenum texture_type, GLenum internal_format,
+                                         GLenum pixel_format, GLenum data_type)
 {
-  m_xfbFramebuffer = 0;
+  GLuint texture;
+  glActiveTexture(GL_TEXTURE9);
+  glGenTextures(1, &texture);
+  glBindTexture(texture_type, texture);
+  if (texture_type == GL_TEXTURE_2D_ARRAY)
+  {
+    glTexParameteri(texture_type, GL_TEXTURE_MAX_LEVEL, 0);
+    glTexImage3D(texture_type, 0, internal_format, m_targetWidth, m_targetHeight, m_EFBLayers, 0,
+                 pixel_format, data_type, nullptr);
+  }
+  else if (texture_type == GL_TEXTURE_2D_MULTISAMPLE_ARRAY)
+  {
+    if (g_ogl_config.bSupports3DTextureStorageMultisample)
+      glTexStorage3DMultisample(texture_type, m_msaaSamples, internal_format, m_targetWidth,
+                                m_targetHeight, m_EFBLayers, false);
+    else
+      glTexImage3DMultisample(texture_type, m_msaaSamples, internal_format, m_targetWidth,
+                              m_targetHeight, m_EFBLayers, false);
+  }
+  else if (texture_type == GL_TEXTURE_2D_MULTISAMPLE)
+  {
+    if (g_ogl_config.bSupports2DTextureStorageMultisample)
+      glTexStorage2DMultisample(texture_type, m_msaaSamples, internal_format, m_targetWidth,
+                                m_targetHeight, false);
+    else
+      glTexImage2DMultisample(texture_type, m_msaaSamples, internal_format, m_targetWidth,
+                              m_targetHeight, false);
+  }
+  else
+  {
+    PanicAlert("Unhandled texture type %d", texture_type);
+  }
+  glBindTexture(texture_type, 0);
+  return texture;
+}
+
+void FramebufferManager::BindLayeredTexture(GLuint texture, const std::vector<GLuint>& framebuffers,
+                                            GLenum attachment, GLenum texture_type)
+{
+  glBindFramebuffer(GL_FRAMEBUFFER, framebuffers[0]);
+  FramebufferTexture(GL_FRAMEBUFFER, attachment, texture_type, texture, 0);
+  // Bind all the other layers as separate FBOs for blitting.
+  for (unsigned int i = 1; i < m_EFBLayers; i++)
+  {
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffers[i]);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, attachment, texture, 0, i);
+  }
+}
+
+bool FramebufferManager::HasStencilBuffer()
+{
+  return m_enable_stencil_buffer;
+}
+
+FramebufferManager::FramebufferManager(int targetWidth, int targetHeight, int msaaSamples,
+                                       bool enable_stencil_buffer)
+{
   m_efbColor = 0;
   m_efbDepth = 0;
   m_efbColorSwap = 0;
@@ -56,8 +263,8 @@ FramebufferManager::FramebufferManager(int targetWidth, int targetHeight, int ms
 
   m_targetWidth = targetWidth;
   m_targetHeight = targetHeight;
-
   m_msaaSamples = msaaSamples;
+  m_enable_stencil_buffer = enable_stencil_buffer;
 
   // The EFB can be set to different pixel formats by the game through the
   // BPMEM_ZCOMPARE register (which should probably have a different name).
@@ -72,349 +279,124 @@ FramebufferManager::FramebufferManager(int targetWidth, int targetHeight, int ms
 
   glActiveTexture(GL_TEXTURE9);
 
-  GLuint glObj[3];
-  glGenTextures(3, glObj);
-  m_efbColor = glObj[0];
-  m_efbDepth = glObj[1];
-  m_efbColorSwap = glObj[2];
-
-  m_EFBLayers = (g_ActiveConfig.iStereoMode > 0) ? 2 : 1;
+  m_EFBLayers = (g_ActiveConfig.stereo_mode != StereoMode::Off) ? 2 : 1;
   m_efbFramebuffer.resize(m_EFBLayers);
   m_resolvedFramebuffer.resize(m_EFBLayers);
 
-  // OpenGL MSAA textures are a different kind of texture type and must be allocated
-  // with a different function, so we create them separately.
+  GLenum depth_internal_format = GL_DEPTH_COMPONENT32F;
+  GLenum depth_pixel_format = GL_DEPTH_COMPONENT;
+  GLenum depth_data_type = GL_FLOAT;
+  if (m_enable_stencil_buffer)
+  {
+    depth_internal_format = GL_DEPTH32F_STENCIL8;
+    depth_pixel_format = GL_DEPTH_STENCIL;
+    depth_data_type = GL_FLOAT_32_UNSIGNED_INT_24_8_REV;
+  }
+
+  const bool multilayer = m_EFBLayers > 1;
+
   if (m_msaaSamples <= 1)
   {
     m_textureType = GL_TEXTURE_2D_ARRAY;
-
-    glBindTexture(m_textureType, m_efbColor);
-    glTexParameteri(m_textureType, GL_TEXTURE_MAX_LEVEL, 0);
-    glTexImage3D(m_textureType, 0, GL_RGBA, m_targetWidth, m_targetHeight, m_EFBLayers, 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, nullptr);
-
-    glBindTexture(m_textureType, m_efbDepth);
-    glTexParameteri(m_textureType, GL_TEXTURE_MAX_LEVEL, 0);
-    glTexImage3D(m_textureType, 0, GL_DEPTH_COMPONENT32F, m_targetWidth, m_targetHeight,
-                 m_EFBLayers, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
-
-    glBindTexture(m_textureType, m_efbColorSwap);
-    glTexParameteri(m_textureType, GL_TEXTURE_MAX_LEVEL, 0);
-    glTexImage3D(m_textureType, 0, GL_RGBA, m_targetWidth, m_targetHeight, m_EFBLayers, 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, nullptr);
   }
   else
   {
-    GLenum resolvedType = GL_TEXTURE_2D_ARRAY;
-
     // Only use a layered multisample texture if needed. Some drivers
     // slow down significantly with single-layered multisample textures.
-    if (m_EFBLayers > 1)
-    {
-      m_textureType = GL_TEXTURE_2D_MULTISAMPLE_ARRAY;
+    m_textureType = multilayer ? GL_TEXTURE_2D_MULTISAMPLE_ARRAY : GL_TEXTURE_2D_MULTISAMPLE;
 
-      if (g_ogl_config.bSupports3DTextureStorage)
-      {
-        glBindTexture(m_textureType, m_efbColor);
-        glTexStorage3DMultisample(m_textureType, m_msaaSamples, GL_RGBA8, m_targetWidth,
-                                  m_targetHeight, m_EFBLayers, false);
+    // Although we are able to access the multisampled texture directly, we don't do it
+    // everywhere. The old way is to "resolve" this multisampled texture by copying it into a
+    // non-sampled texture. This would lead to an unneeded copy of the EFB, so we are going to
+    // avoid it. But as this job isn't done right now, we do need that texture for resolving:
+    GLenum resolvedType = GL_TEXTURE_2D_ARRAY;
 
-        glBindTexture(m_textureType, m_efbDepth);
-        glTexStorage3DMultisample(m_textureType, m_msaaSamples, GL_DEPTH_COMPONENT32F,
-                                  m_targetWidth, m_targetHeight, m_EFBLayers, false);
-
-        glBindTexture(m_textureType, m_efbColorSwap);
-        glTexStorage3DMultisample(m_textureType, m_msaaSamples, GL_RGBA8, m_targetWidth,
-                                  m_targetHeight, m_EFBLayers, false);
-        glBindTexture(m_textureType, 0);
-      }
-      else
-      {
-        glBindTexture(m_textureType, m_efbColor);
-        glTexImage3DMultisample(m_textureType, m_msaaSamples, GL_RGBA, m_targetWidth,
-                                m_targetHeight, m_EFBLayers, false);
-
-        glBindTexture(m_textureType, m_efbDepth);
-        glTexImage3DMultisample(m_textureType, m_msaaSamples, GL_DEPTH_COMPONENT32F, m_targetWidth,
-                                m_targetHeight, m_EFBLayers, false);
-
-        glBindTexture(m_textureType, m_efbColorSwap);
-        glTexImage3DMultisample(m_textureType, m_msaaSamples, GL_RGBA, m_targetWidth,
-                                m_targetHeight, m_EFBLayers, false);
-        glBindTexture(m_textureType, 0);
-      }
-    }
-    else
-    {
-      m_textureType = GL_TEXTURE_2D_MULTISAMPLE;
-
-      if (g_ogl_config.bSupports2DTextureStorage)
-      {
-        glBindTexture(m_textureType, m_efbColor);
-        glTexStorage2DMultisample(m_textureType, m_msaaSamples, GL_RGBA8, m_targetWidth,
-                                  m_targetHeight, false);
-
-        glBindTexture(m_textureType, m_efbDepth);
-        glTexStorage2DMultisample(m_textureType, m_msaaSamples, GL_DEPTH_COMPONENT32F,
-                                  m_targetWidth, m_targetHeight, false);
-
-        glBindTexture(m_textureType, m_efbColorSwap);
-        glTexStorage2DMultisample(m_textureType, m_msaaSamples, GL_RGBA8, m_targetWidth,
-                                  m_targetHeight, false);
-        glBindTexture(m_textureType, 0);
-      }
-      else
-      {
-        glBindTexture(m_textureType, m_efbColor);
-        glTexImage2DMultisample(m_textureType, m_msaaSamples, GL_RGBA, m_targetWidth,
-                                m_targetHeight, false);
-
-        glBindTexture(m_textureType, m_efbDepth);
-        glTexImage2DMultisample(m_textureType, m_msaaSamples, GL_DEPTH_COMPONENT32F, m_targetWidth,
-                                m_targetHeight, false);
-
-        glBindTexture(m_textureType, m_efbColorSwap);
-        glTexImage2DMultisample(m_textureType, m_msaaSamples, GL_RGBA, m_targetWidth,
-                                m_targetHeight, false);
-        glBindTexture(m_textureType, 0);
-      }
-    }
-
-    // Although we are able to access the multisampled texture directly, we don't do it everywhere.
-    // The old way is to "resolve" this multisampled texture by copying it into a non-sampled
-    // texture.
-    // This would lead to an unneeded copy of the EFB, so we are going to avoid it.
-    // But as this job isn't done right now, we do need that texture for resolving:
-    glGenTextures(2, glObj);
-    m_resolvedColorTexture = glObj[0];
-    m_resolvedDepthTexture = glObj[1];
-
-    glBindTexture(resolvedType, m_resolvedColorTexture);
-    glTexParameteri(resolvedType, GL_TEXTURE_MAX_LEVEL, 0);
-    glTexImage3D(resolvedType, 0, GL_RGBA, m_targetWidth, m_targetHeight, m_EFBLayers, 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, nullptr);
-
-    glBindTexture(resolvedType, m_resolvedDepthTexture);
-    glTexParameteri(resolvedType, GL_TEXTURE_MAX_LEVEL, 0);
-    glTexImage3D(resolvedType, 0, GL_DEPTH_COMPONENT32F, m_targetWidth, m_targetHeight, m_EFBLayers,
-                 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    m_resolvedColorTexture = CreateTexture(resolvedType, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
+    m_resolvedDepthTexture =
+        CreateTexture(resolvedType, depth_internal_format, depth_pixel_format, depth_data_type);
 
     // Bind resolved textures to resolved framebuffer.
     glGenFramebuffers(m_EFBLayers, m_resolvedFramebuffer.data());
-    glBindFramebuffer(GL_FRAMEBUFFER, m_resolvedFramebuffer[0]);
-    FramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, resolvedType, m_resolvedColorTexture,
-                       0);
-    FramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, resolvedType, m_resolvedDepthTexture,
-                       0);
-
-    // Bind all the other layers as separate FBOs for blitting.
-    for (unsigned int i = 1; i < m_EFBLayers; i++)
-    {
-      glBindFramebuffer(GL_FRAMEBUFFER, m_resolvedFramebuffer[i]);
-      glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, m_resolvedColorTexture, 0, i);
-      glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, m_resolvedDepthTexture, 0, i);
-    }
+    BindLayeredTexture(m_resolvedColorTexture, m_resolvedFramebuffer, GL_COLOR_ATTACHMENT0,
+                       resolvedType);
+    BindLayeredTexture(m_resolvedDepthTexture, m_resolvedFramebuffer, GL_DEPTH_ATTACHMENT,
+                       resolvedType);
+    if (m_enable_stencil_buffer)
+      BindLayeredTexture(m_resolvedDepthTexture, m_resolvedFramebuffer, GL_STENCIL_ATTACHMENT,
+                         resolvedType);
   }
 
-  // Create XFB framebuffer; targets will be created elsewhere.
-  glGenFramebuffers(1, &m_xfbFramebuffer);
+  m_efbColor = CreateTexture(m_textureType, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
+  m_efbDepth =
+      CreateTexture(m_textureType, depth_internal_format, depth_pixel_format, depth_data_type);
+  m_efbColorSwap = CreateTexture(m_textureType, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
 
   // Bind target textures to EFB framebuffer.
   glGenFramebuffers(m_EFBLayers, m_efbFramebuffer.data());
-  glBindFramebuffer(GL_FRAMEBUFFER, m_efbFramebuffer[0]);
-  FramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, m_textureType, m_efbColor, 0);
-  FramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, m_textureType, m_efbDepth, 0);
+  BindLayeredTexture(m_efbColor, m_efbFramebuffer, GL_COLOR_ATTACHMENT0, m_textureType);
+  BindLayeredTexture(m_efbDepth, m_efbFramebuffer, GL_DEPTH_ATTACHMENT, m_textureType);
+  if (m_enable_stencil_buffer)
+    BindLayeredTexture(m_efbDepth, m_efbFramebuffer, GL_STENCIL_ATTACHMENT, m_textureType);
 
-  // Bind all the other layers as separate FBOs for blitting.
-  for (unsigned int i = 1; i < m_EFBLayers; i++)
-  {
-    glBindFramebuffer(GL_FRAMEBUFFER, m_efbFramebuffer[i]);
-    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, m_efbColor, 0, i);
-    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, m_efbDepth, 0, i);
-  }
-
-  // EFB framebuffer is currently bound, make sure to clear its alpha value to 1.f
+  // EFB framebuffer is currently bound, make sure to clear it before use.
   glViewport(0, 0, m_targetWidth, m_targetHeight);
   glScissor(0, 0, m_targetWidth, m_targetHeight);
-  glClearColor(0.f, 0.f, 0.f, 1.f);
+  glClearColor(0.f, 0.f, 0.f, 0.f);
   glClearDepthf(1.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  if (m_enable_stencil_buffer)
+  {
+    glClearStencil(0);
+    glClear(GL_STENCIL_BUFFER_BIT);
+  }
 
   // reinterpret pixel format
-  const char* vs = m_EFBLayers > 1 ? "void main(void) {\n"
-                                     "	vec2 rawpos = vec2(gl_VertexID&1, gl_VertexID&2);\n"
-                                     "	gl_Position = vec4(rawpos*2.0-1.0, 0.0, 1.0);\n"
-                                     "}\n" :
-                                     "flat out int layer;\n"
-                                     "void main(void) {\n"
-                                     "	layer = 0;\n"
-                                     "	vec2 rawpos = vec2(gl_VertexID&1, gl_VertexID&2);\n"
-                                     "	gl_Position = vec4(rawpos*2.0-1.0, 0.0, 1.0);\n"
-                                     "}\n";
+  std::string vs = GLSL_REINTERPRET_PIXELFMT_VS;
 
   // The way to sample the EFB is based on the on the current configuration.
   // As we use the same sampling way for both interpreting shaders, the sampling
   // shader are generated first:
   std::string sampler;
+
   if (m_msaaSamples <= 1)
   {
     // non-msaa, so just fetch the pixel
-    sampler = "SAMPLER_BINDING(9) uniform sampler2DArray samp9;\n"
-              "vec4 sampleEFB(ivec3 pos) {\n"
-              "	return texelFetch(samp9, pos, 0);\n"
-              "}\n";
+    sampler = StringFromFormat(GLSL_SHADER_FS, multilayer, false);
   }
   else if (g_ActiveConfig.backend_info.bSupportsSSAA)
   {
     // msaa + sample shading available, so just fetch the sample
     // This will lead to sample shading, but it's the only way to not loose
     // the values of each sample.
-    if (m_EFBLayers > 1)
-    {
-      sampler = "SAMPLER_BINDING(9) uniform sampler2DMSArray samp9;\n"
-                "vec4 sampleEFB(ivec3 pos) {\n"
-                "	return texelFetch(samp9, pos, gl_SampleID);\n"
-                "}\n";
-    }
-    else
-    {
-      sampler = "SAMPLER_BINDING(9) uniform sampler2DMS samp9;\n"
-                "vec4 sampleEFB(ivec3 pos) {\n"
-                "	return texelFetch(samp9, pos.xy, gl_SampleID);\n"
-                "}\n";
-    }
+    sampler = StringFromFormat(GLSL_SHADER_FS, multilayer, true);
   }
   else
   {
     // msaa without sample shading: calculate the mean value of the pixel
-    std::stringstream samples;
-    samples << m_msaaSamples;
-    if (m_EFBLayers > 1)
-    {
-      sampler = "SAMPLER_BINDING(9) uniform sampler2DMSArray samp9;\n"
-                "vec4 sampleEFB(ivec3 pos) {\n"
-                "	vec4 color = vec4(0.0, 0.0, 0.0, 0.0);\n"
-                "	for(int i=0; i<" +
-                samples.str() + "; i++)\n"
-                                "		color += texelFetch(samp9, pos, i);\n"
-                                "	return color / " +
-                samples.str() + ";\n"
-                                "}\n";
-    }
-    else
-    {
-      sampler = "SAMPLER_BINDING(9) uniform sampler2DMS samp9;\n"
-                "vec4 sampleEFB(ivec3 pos) {\n"
-                "	vec4 color = vec4(0.0, 0.0, 0.0, 0.0);\n"
-                "	for(int i=0; i<" +
-                samples.str() + "; i++)\n"
-                                "		color += texelFetch(samp9, pos.xy, i);\n"
-                                "	return color / " +
-                samples.str() + ";\n"
-                                "}\n";
-    }
+    sampler = StringFromFormat(GLSL_SAMPLE_EFB_FS, multilayer, m_msaaSamples, m_msaaSamples);
   }
 
-  std::string ps_rgba6_to_rgb8 =
-      sampler + "flat in int layer;\n"
-                "out vec4 ocol0;\n"
-                "void main()\n"
-                "{\n"
-                "	ivec4 src6 = ivec4(round(sampleEFB(ivec3(gl_FragCoord.xy, layer)) * 63.f));\n"
-                "	ivec4 dst8;\n"
-                "	dst8.r = (src6.r << 2) | (src6.g >> 4);\n"
-                "	dst8.g = ((src6.g & 0xF) << 4) | (src6.b >> 2);\n"
-                "	dst8.b = ((src6.b & 0x3) << 6) | src6.a;\n"
-                "	dst8.a = 255;\n"
-                "	ocol0 = float4(dst8) / 255.f;\n"
-                "}";
+  std::string ps_rgba6_to_rgb8 = sampler + GLSL_RGBA6_TO_RGB8_FS;
 
-  std::string ps_rgb8_to_rgba6 =
-      sampler + "flat in int layer;\n"
-                "out vec4 ocol0;\n"
-                "void main()\n"
-                "{\n"
-                "	ivec4 src8 = ivec4(round(sampleEFB(ivec3(gl_FragCoord.xy, layer)) * 255.f));\n"
-                "	ivec4 dst6;\n"
-                "	dst6.r = src8.r >> 2;\n"
-                "	dst6.g = ((src8.r & 0x3) << 4) | (src8.g >> 4);\n"
-                "	dst6.b = ((src8.g & 0xF) << 2) | (src8.b >> 6);\n"
-                "	dst6.a = src8.b & 0x3F;\n"
-                "	ocol0 = float4(dst6) / 63.f;\n"
-                "}";
+  std::string ps_rgb8_to_rgba6 = sampler + GLSL_RGB8_TO_RGBA6_FS;
 
-  std::stringstream vertices, layers;
-  vertices << m_EFBLayers * 3;
-  layers << m_EFBLayers;
-  std::string gs = "layout(triangles) in;\n"
-                   "layout(triangle_strip, max_vertices = " +
-                   vertices.str() + ") out;\n"
-                                    "flat out int layer;\n"
-                                    "void main()\n"
-                                    "{\n"
-                                    "	for (int j = 0; j < " +
-                   layers.str() + "; ++j) {\n"
-                                  "		for (int i = 0; i < 3; ++i) {\n"
-                                  "			layer = j;\n"
-                                  "			gl_Layer = j;\n"
-                                  "			gl_Position = gl_in[i].gl_Position;\n"
-                                  "			EmitVertex();\n"
-                                  "		}\n"
-                                  "		EndPrimitive();\n"
-                                  "	}\n"
-                                  "}\n";
+  std::string gs = StringFromFormat(GLSL_GS, m_EFBLayers * 3, m_EFBLayers);
 
-  ProgramShaderCache::CompileShader(m_pixel_format_shaders[0], vs, ps_rgb8_to_rgba6.c_str(),
-                                    (m_EFBLayers > 1) ? gs : "");
-  ProgramShaderCache::CompileShader(m_pixel_format_shaders[1], vs, ps_rgba6_to_rgb8.c_str(),
-                                    (m_EFBLayers > 1) ? gs : "");
+  ProgramShaderCache::CompileShader(m_pixel_format_shaders[0], vs, ps_rgb8_to_rgba6,
+                                    multilayer ? gs : "");
+  ProgramShaderCache::CompileShader(m_pixel_format_shaders[1], vs, ps_rgba6_to_rgb8,
+                                    multilayer ? gs : "");
+
+  const auto prefix = multilayer ? "g" : "v";
 
   ProgramShaderCache::CompileShader(
-      m_EfbPokes,
-      StringFromFormat("in vec2 rawpos;\n"
-                       "in vec4 color0;\n"  // color
-                       "in int color1;\n"   // depth
-                       "out vec4 v_c;\n"
-                       "out float v_z;\n"
-                       "void main(void) {\n"
-                       "	gl_Position = vec4(((rawpos + 0.5) / vec2(640.0, 528.0) * 2.0 - 1.0) * "
-                       "vec2(1.0, -1.0), 0.0, 1.0);\n"
-                       "	gl_PointSize = %d.0 / 640.0;\n"
-                       "	v_c = color0.bgra;\n"
-                       "	v_z = float(color1 & 0xFFFFFF) / 16777216.0;\n"
-                       "}\n",
-                       m_targetWidth),
+      m_EfbPokes, StringFromFormat(GLSL_EFB_POKE_VERTEX_VS, m_targetWidth),
 
-      StringFromFormat("in vec4 %s_c;\n"
-                       "in float %s_z;\n"
-                       "out vec4 ocol0;\n"
-                       "void main(void) {\n"
-                       "	ocol0 = %s_c;\n"
-                       "	gl_FragDepth = %s_z;\n"
-                       "}\n",
-                       m_EFBLayers > 1 ? "g" : "v", m_EFBLayers > 1 ? "g" : "v",
-                       m_EFBLayers > 1 ? "g" : "v", m_EFBLayers > 1 ? "g" : "v"),
+      StringFromFormat(GLSL_EFB_POKE_PIXEL_FS, prefix, prefix, prefix, prefix),
 
-      m_EFBLayers > 1 ? StringFromFormat("layout(points) in;\n"
-                                         "layout(points, max_vertices = %d) out;\n"
-                                         "in vec4 v_c[1];\n"
-                                         "in float v_z[1];\n"
-                                         "out vec4 g_c;\n"
-                                         "out float g_z;\n"
-                                         "void main()\n"
-                                         "{\n"
-                                         "	for (int j = 0; j < %d; ++j) {\n"
-                                         "		gl_Layer = j;\n"
-                                         "		gl_Position = gl_in[0].gl_Position;\n"
-                                         "		gl_PointSize = %d.0 / 640.0;\n"
-                                         "		g_c = v_c[0];\n"
-                                         "		g_z = v_z[0];\n"
-                                         "		EmitVertex();\n"
-                                         "		EndPrimitive();\n"
-                                         "	}\n"
-                                         "}\n",
-                                         m_EFBLayers, m_EFBLayers, m_targetWidth) :
-                        "");
+      multilayer ?
+          StringFromFormat(GLSL_EFB_POKE_GEOMETRY_GS, m_EFBLayers, m_EFBLayers, m_targetWidth) :
+          "");
   glGenBuffers(1, &m_EfbPokes_VBO);
   glGenVertexArrays(1, &m_EfbPokes_VAO);
   glBindBuffer(GL_ARRAY_BUFFER, m_EfbPokes_VBO);
@@ -428,8 +410,10 @@ FramebufferManager::FramebufferManager(int targetWidth, int targetHeight, int ms
   glEnableVertexAttribArray(SHADER_COLOR1_ATTRIB);
   glVertexAttribIPointer(SHADER_COLOR1_ATTRIB, 1, GL_INT, sizeof(EfbPokeData),
                          (void*)offsetof(EfbPokeData, data));
+  glBindBuffer(GL_ARRAY_BUFFER,
+               static_cast<VertexManager*>(g_vertex_manager.get())->GetVertexBufferHandle());
 
-  if (GLInterface->GetMode() == GLInterfaceMode::MODE_OPENGL)
+  if (!static_cast<Renderer*>(g_renderer.get())->IsGLES())
     glEnable(GL_PROGRAM_POINT_SIZE);
 }
 
@@ -447,9 +431,6 @@ FramebufferManager::~FramebufferManager()
   // Required, as these are static class members
   m_efbFramebuffer.clear();
   m_resolvedFramebuffer.clear();
-
-  glDeleteFramebuffers(1, &m_xfbFramebuffer);
-  m_xfbFramebuffer = 0;
 
   glObj[0] = m_resolvedColorTexture;
   glObj[1] = m_resolvedDepthTexture;
@@ -538,19 +519,29 @@ GLuint FramebufferManager::GetEFBDepthTexture(const EFBRectangle& sourceRc)
   }
 }
 
-void FramebufferManager::CopyToRealXFB(u32 xfbAddr, u32 fbStride, u32 fbHeight,
-                                       const EFBRectangle& sourceRc, float Gamma)
+void FramebufferManager::ResolveEFBStencilTexture()
 {
-  u8* xfb_in_ram = Memory::GetPointer(xfbAddr);
-  if (!xfb_in_ram)
-  {
-    WARN_LOG(VIDEO, "Tried to copy to invalid XFB address");
+  if (m_msaaSamples <= 1)
     return;
+
+  // Resolve.
+  for (unsigned int i = 0; i < m_EFBLayers; i++)
+  {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_efbFramebuffer[i]);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_resolvedFramebuffer[i]);
+    glBlitFramebuffer(0, 0, m_targetWidth, m_targetHeight, 0, 0, m_targetWidth, m_targetHeight,
+                      GL_STENCIL_BUFFER_BIT, GL_NEAREST);
   }
 
-  TargetRectangle targetRc = g_renderer->ConvertEFBRectangle(sourceRc);
-  TextureConverter::EncodeToRamYUYV(ResolveAndGetRenderTarget(sourceRc), targetRc, xfb_in_ram,
-                                    sourceRc.GetWidth(), fbStride, fbHeight);
+  // Return to EFB.
+  glBindFramebuffer(GL_FRAMEBUFFER, m_efbFramebuffer[0]);
+}
+
+GLuint FramebufferManager::GetResolvedFramebuffer()
+{
+  if (m_msaaSamples <= 1)
+    return m_efbFramebuffer[0];
+  return m_resolvedFramebuffer[0];
 }
 
 void FramebufferManager::SetFramebuffer(GLuint fb)
@@ -589,8 +580,6 @@ void FramebufferManager::ReinterpretPixelData(unsigned int convtype)
 {
   g_renderer->ResetAPIState();
 
-  OpenGL_BindAttributelessVAO();
-
   GLuint src_texture = 0;
 
   // We aren't allowed to render and sample the same texture in one draw call,
@@ -608,73 +597,18 @@ void FramebufferManager::ReinterpretPixelData(unsigned int convtype)
   g_sampler_cache->BindNearestSampler(9);
 
   m_pixel_format_shaders[convtype ? 1 : 0].Bind();
+  ProgramShaderCache::BindVertexFormat(nullptr);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
   glBindTexture(m_textureType, 0);
 
   g_renderer->RestoreAPIState();
 }
 
-XFBSource::~XFBSource()
-{
-  glDeleteTextures(1, &texture);
-}
-
-void XFBSource::DecodeToTexture(u32 xfbAddr, u32 fbWidth, u32 fbHeight)
-{
-  TextureConverter::DecodeToTexture(xfbAddr, fbWidth, fbHeight, texture);
-}
-
-void XFBSource::CopyEFB(float Gamma)
-{
-  g_renderer->ResetAPIState();
-
-  // Copy EFB data to XFB and restore render target again
-  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, FramebufferManager::GetXFBFramebuffer());
-
-  for (int i = 0; i < m_layers; i++)
-  {
-    // Bind EFB and texture layer
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, FramebufferManager::GetEFBFramebuffer(i));
-    glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, texture, 0, i);
-
-    glBlitFramebuffer(0, 0, texWidth, texHeight, 0, 0, texWidth, texHeight, GL_COLOR_BUFFER_BIT,
-                      GL_NEAREST);
-  }
-
-  // Return to EFB.
-  FramebufferManager::SetFramebuffer(0);
-
-  g_renderer->RestoreAPIState();
-}
-
-std::unique_ptr<XFBSourceBase> FramebufferManager::CreateXFBSource(unsigned int target_width,
-                                                                   unsigned int target_height,
-                                                                   unsigned int layers)
-{
-  GLuint texture;
-
-  glGenTextures(1, &texture);
-
-  glActiveTexture(GL_TEXTURE9);
-  glBindTexture(GL_TEXTURE_2D_ARRAY, texture);
-  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0);
-  glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, target_width, target_height, layers, 0, GL_RGBA,
-               GL_UNSIGNED_BYTE, nullptr);
-
-  return std::make_unique<XFBSource>(texture, layers);
-}
-
-void FramebufferManager::GetTargetSize(unsigned int* width, unsigned int* height)
-{
-  *width = m_targetWidth;
-  *height = m_targetHeight;
-}
-
 void FramebufferManager::PokeEFB(EFBAccessType type, const EfbPokeData* points, size_t num_points)
 {
   g_renderer->ResetAPIState();
 
-  if (type == POKE_Z)
+  if (type == EFBAccessType::PokeZ)
   {
     glDepthMask(GL_TRUE);
     glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -689,6 +623,8 @@ void FramebufferManager::PokeEFB(EFBAccessType type, const EfbPokeData* points, 
   glViewport(0, 0, m_targetWidth, m_targetHeight);
   glDrawArrays(GL_POINTS, 0, (GLsizei)num_points);
 
+  glBindBuffer(GL_ARRAY_BUFFER,
+               static_cast<VertexManager*>(g_vertex_manager.get())->GetVertexBufferHandle());
   g_renderer->RestoreAPIState();
 
   // TODO: Could just update the EFB cache with the new value

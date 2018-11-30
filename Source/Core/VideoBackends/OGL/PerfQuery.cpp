@@ -6,24 +6,23 @@
 
 #include "Common/CommonFuncs.h"
 #include "Common/CommonTypes.h"
-#include "Common/GL/GLInterfaceBase.h"
-#include "Common/GL/GLUtil.h"
+#include "Common/GL/GLExtensions/GLExtensions.h"
 
 #include "VideoBackends/OGL/PerfQuery.h"
-#include "VideoCommon/RenderBase.h"
+#include "VideoBackends/OGL/Render.h"
+#include "VideoCommon/VideoConfig.h"
 
 namespace OGL
 {
 std::unique_ptr<PerfQueryBase> GetPerfQuery()
 {
-  if (GLInterface->GetMode() == GLInterfaceMode::MODE_OPENGLES3 &&
-      GLExtensions::Supports("GL_NV_occlusion_query_samples"))
+  const bool is_gles = static_cast<Renderer*>(g_renderer.get())->IsGLES();
+  if (is_gles && GLExtensions::Supports("GL_NV_occlusion_query_samples"))
     return std::make_unique<PerfQueryGLESNV>();
-
-  if (GLInterface->GetMode() == GLInterfaceMode::MODE_OPENGLES3)
+  else if (is_gles)
     return std::make_unique<PerfQueryGL>(GL_ANY_SAMPLES_PASSED);
-
-  return std::make_unique<PerfQueryGL>(GL_SAMPLES_PASSED);
+  else
+    return std::make_unique<PerfQueryGL>(GL_SAMPLES_PASSED);
 }
 
 PerfQuery::PerfQuery() : m_query_read_pos()
@@ -79,7 +78,7 @@ u32 PerfQuery::GetQueryResult(PerfQueryType type)
     result = m_results[PQG_EFB_COPY_CLOCKS];
   }
 
-  return result / 4;
+  return result;
 }
 
 // Implementations
@@ -155,8 +154,16 @@ void PerfQueryGL::FlushOne()
   glGetQueryObjectuiv(entry.query_id, GL_QUERY_RESULT, &result);
 
   // NOTE: Reported pixel metrics should be referenced to native resolution
-  m_results[entry.query_type] += (u64)result * EFB_WIDTH / g_renderer->GetTargetWidth() *
-                                 EFB_HEIGHT / g_renderer->GetTargetHeight();
+  // TODO: Dropping the lower 2 bits from this count should be closer to actual
+  // hardware behavior when drawing triangles.
+  result = static_cast<u64>(result) * EFB_WIDTH * EFB_HEIGHT /
+           (g_renderer->GetTargetWidth() * g_renderer->GetTargetHeight());
+
+  // Adjust for multisampling
+  if (g_ActiveConfig.iMultisamples > 1)
+    result /= g_ActiveConfig.iMultisamples;
+
+  m_results[entry.query_type] += result;
 
   m_query_read_pos = (m_query_read_pos + 1) % m_query_buffer.size();
   --m_query_count;
@@ -241,8 +248,10 @@ void PerfQueryGLESNV::FlushOne()
   glGetOcclusionQueryuivNV(entry.query_id, GL_OCCLUSION_TEST_RESULT_HP, &result);
 
   // NOTE: Reported pixel metrics should be referenced to native resolution
-  m_results[entry.query_type] += (u64)result * EFB_WIDTH / g_renderer->GetTargetWidth() *
-                                 EFB_HEIGHT / g_renderer->GetTargetHeight();
+  // TODO: Dropping the lower 2 bits from this count should be closer to actual
+  // hardware behavior when drawing triangles.
+  m_results[entry.query_type] += static_cast<u64>(result) * EFB_WIDTH * EFB_HEIGHT /
+                                 (g_renderer->GetTargetWidth() * g_renderer->GetTargetHeight());
 
   m_query_read_pos = (m_query_read_pos + 1) % m_query_buffer.size();
   --m_query_count;
@@ -255,4 +264,4 @@ void PerfQueryGLESNV::FlushResults()
     FlushOne();
 }
 
-}  // namespace
+}  // namespace OGL

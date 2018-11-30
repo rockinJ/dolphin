@@ -6,6 +6,7 @@
 
 #include <array>
 #include <string>
+#include <tuple>
 #include <type_traits>
 
 #include "Common/Assert.h"
@@ -61,9 +62,10 @@ inline bool IsMMIOAddress(u32 address)
 // The block ID can easily be computed by simply checking bit 24 (CC vs. CD).
 inline u32 UniqueID(u32 address)
 {
-  _dbg_assert_msg_(MEMMAP, ((address & 0xFFFF0000) == 0x0C000000) ||
-                               ((address & 0xFFFF0000) == 0x0D000000) ||
-                               ((address & 0xFFFF0000) == 0x0D800000),
+  DEBUG_ASSERT_MSG(MEMMAP,
+                   ((address & 0xFFFF0000) == 0x0C000000) ||
+                       ((address & 0xFFFF0000) == 0x0D000000) ||
+                       ((address & 0xFFFF0000) == 0x0D800000),
                    "Trying to get the ID of a non-existing MMIO address.");
 
   return (((address >> 24) & 1) << 16) | (address & 0xFFFF);
@@ -177,45 +179,30 @@ private:
   HandlerArray<u32>::Write m_write_handlers32;
 
   // Getter functions for the handler arrays.
-  //
-  // TODO:
-  // It would be desirable to clean these methods up using tuples, i.e. doing something like
-  //
-  //     auto handlers = std::tie(m_read_handlers8, m_read_handlers16, m_read_handlers32);
-  //     return std::get<Unit>(handlers)[index];
-  //
-  // However, we cannot use this currently because of a compiler bug in clang, presumably related
-  // to http://llvm.org/bugs/show_bug.cgi?id=18345, due to which the above code makes the compiler
-  // exceed the template recursion depth.
-  // As a workaround, we cast all handlers to the requested one's type. This cast will
-  // compile to a NOP for the returned member variable, but it's necessary to get this
-  // code to compile at all.
   template <typename Unit>
   ReadHandler<Unit>& GetReadHandler(size_t index)
   {
-    static_assert(std::is_same<Unit, u8>::value || std::is_same<Unit, u16>::value ||
-                      std::is_same<Unit, u32>::value,
+    static_assert(std::is_same<Unit, u8>() || std::is_same<Unit, u16>() ||
+                      std::is_same<Unit, u32>(),
                   "Invalid unit used");
+
+    auto handlers = std::tie(m_read_handlers8, m_read_handlers16, m_read_handlers32);
+
     using ArrayType = typename HandlerArray<Unit>::Read;
-    ArrayType& handler = *(std::is_same<Unit, u8>::value ?
-                               (ArrayType*)&m_read_handlers8 :
-                               std::is_same<Unit, u16>::value ? (ArrayType*)&m_read_handlers16 :
-                                                                (ArrayType*)&m_read_handlers32);
-    return handler[index];
+    return std::get<ArrayType&>(handlers)[index];
   }
 
   template <typename Unit>
   WriteHandler<Unit>& GetWriteHandler(size_t index)
   {
-    static_assert(std::is_same<Unit, u8>::value || std::is_same<Unit, u16>::value ||
-                      std::is_same<Unit, u32>::value,
+    static_assert(std::is_same<Unit, u8>() || std::is_same<Unit, u16>() ||
+                      std::is_same<Unit, u32>(),
                   "Invalid unit used");
+
+    auto handlers = std::tie(m_write_handlers8, m_write_handlers16, m_write_handlers32);
+
     using ArrayType = typename HandlerArray<Unit>::Write;
-    ArrayType& handler = *(std::is_same<Unit, u8>::value ?
-                               (ArrayType*)&m_write_handlers8 :
-                               std::is_same<Unit, u16>::value ? (ArrayType*)&m_write_handlers16 :
-                                                                (ArrayType*)&m_write_handlers32);
-    return handler[index];
+    return std::get<ArrayType&>(handlers)[index];
   }
 };
 
@@ -224,13 +211,13 @@ private:
 template <>
 inline u64 Mapping::Read<u64>(u32 addr)
 {
-  _dbg_assert_(MEMMAP, 0);
+  DEBUG_ASSERT(0);
   return 0;
 }
 
 template <>
 inline void Mapping::Write(u32 addr, u64 val)
 {
-  _dbg_assert_(MEMMAP, 0);
+  DEBUG_ASSERT(0);
 }
 }

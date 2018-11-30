@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <deque>
 #include <list>
 #include <map>
@@ -25,37 +26,15 @@
 #include <vector>
 
 #include "Common/Assert.h"
-#include "Common/Common.h"
 #include "Common/CommonTypes.h"
-#include "Common/FileUtil.h"
+#include "Common/Compiler.h"
 #include "Common/Flag.h"
 #include "Common/Logging/Log.h"
 
-// ewww
-
-#ifndef __has_feature
-#define __has_feature(x) (0)
-#endif
-
-#if (__has_feature(is_trivially_copyable) &&                                                       \
-     (defined(_LIBCPP_VERSION) || defined(__GLIBCXX__))) ||                                        \
-    (defined(__GNUC__) && __GNUC__ >= 5)
-#define IsTriviallyCopyable(T)                                                                     \
-  std::is_trivially_copyable<typename std::remove_volatile<T>::type>::value
-#elif __GNUC__
-#define IsTriviallyCopyable(T) std::has_trivial_copy_constructor<T>::value
-#elif _MSC_VER
-// (shuffle2) see https://github.com/dolphin-emu/dolphin/pull/2218
-#define IsTriviallyCopyable(T) 1
-#else
-#error No version of is_trivially_copyable
-#endif
-
-template <class T>
-struct LinkedListItem : public T
-{
-  LinkedListItem<T>* next;
-};
+// XXX: Replace this with std::is_trivially_copyable<T> once we stop using volatile
+// on things that are put in savestates, as volatile types are not trivially copyable.
+template <typename T>
+constexpr bool IsTriviallyCopyable = std::is_trivially_copyable<std::remove_volatile_t<T>>::value;
 
 // Wrapper class
 class PointerWrap
@@ -126,7 +105,7 @@ public:
     case MODE_WRITE:
     case MODE_MEASURE:
     case MODE_VERIFY:
-      for (V& val : x)
+      for (const V& val : x)
       {
         Do(val);
       }
@@ -174,7 +153,7 @@ public:
   template <typename T>
   void DoArray(T* x, u32 count)
   {
-    static_assert(IsTriviallyCopyable(T), "Only sane for trivially copyable types");
+    static_assert(IsTriviallyCopyable<T>, "Only sane for trivially copyable types");
     DoVoid(x, count * sizeof(T));
   }
 
@@ -204,7 +183,7 @@ public:
   template <typename T>
   void Do(T& x)
   {
-    static_assert(IsTriviallyCopyable(T), "Only sane for trivially copyable types");
+    static_assert(IsTriviallyCopyable<T>, "Only sane for trivially copyable types");
     // Note:
     // Usually we can just use x = **ptr, etc.  However, this doesn't work
     // for unions containing BitFields (long story, stupid language rules)
@@ -244,67 +223,6 @@ public:
     }
   }
 
-  // Let's pretend std::list doesn't exist!
-  template <class T, LinkedListItem<T>* (*TNew)(), void (*TFree)(LinkedListItem<T>*),
-            void (*TDo)(PointerWrap&, T*)>
-  void DoLinkedList(LinkedListItem<T>*& list_start, LinkedListItem<T>** list_end = 0)
-  {
-    LinkedListItem<T>* list_cur = list_start;
-    LinkedListItem<T>* prev = nullptr;
-
-    while (true)
-    {
-      u8 shouldExist = !!list_cur;
-      Do(shouldExist);
-      if (shouldExist == 1)
-      {
-        LinkedListItem<T>* cur = list_cur ? list_cur : TNew();
-        TDo(*this, (T*)cur);
-        if (!list_cur)
-        {
-          if (mode == MODE_READ)
-          {
-            cur->next = nullptr;
-            list_cur = cur;
-            if (prev)
-              prev->next = cur;
-            else
-              list_start = cur;
-          }
-          else
-          {
-            TFree(cur);
-            continue;
-          }
-        }
-      }
-      else
-      {
-        if (mode == MODE_READ)
-        {
-          if (prev)
-            prev->next = nullptr;
-          if (list_end)
-            *list_end = prev;
-          if (list_cur)
-          {
-            if (list_start == list_cur)
-              list_start = nullptr;
-            do
-            {
-              LinkedListItem<T>* next = list_cur->next;
-              TFree(list_cur);
-              list_cur = next;
-            } while (list_cur);
-          }
-        }
-        break;
-      }
-      prev = list_cur;
-      list_cur = list_cur->next;
-    }
-  }
-
   void DoMarker(const std::string& prevName, u32 arbitraryNumber = 0x42)
   {
     u32 cookie = arbitraryNumber;
@@ -319,19 +237,25 @@ public:
     }
   }
 
+  template <typename T, typename Functor>
+  void DoEachElement(T& container, Functor member)
+  {
+    u32 size = static_cast<u32>(container.size());
+    Do(size);
+    container.resize(size);
+
+    for (auto& elem : container)
+      member(*this, elem);
+  }
+
 private:
   template <typename T>
   void DoContainer(T& x)
   {
-    u32 size = (u32)x.size();
-    Do(size);
-    x.resize(size);
-
-    for (auto& elem : x)
-      Do(elem);
+    DoEachElement(x, [](PointerWrap& p, typename T::value_type& elem) { p.Do(elem); });
   }
 
-  __forceinline void DoVoid(void* data, u32 size)
+  DOLPHIN_FORCE_INLINE void DoVoid(void* data, u32 size)
   {
     switch (mode)
     {
@@ -347,7 +271,7 @@ private:
       break;
 
     case MODE_VERIFY:
-      _dbg_assert_msg_(COMMON, !memcmp(data, *ptr, size),
+      DEBUG_ASSERT_MSG(COMMON, !memcmp(data, *ptr, size),
                        "Savestate verification failure: buf %p != %p (size %u).\n", data, *ptr,
                        size);
       break;
@@ -355,126 +279,4 @@ private:
 
     *ptr += size;
   }
-};
-
-// NOTE: this class is only used in DolphinWX/ISOFile.cpp for caching loaded
-// ISO data. It will be removed when DolphinWX is, so please don't use it.
-class CChunkFileReader
-{
-public:
-  // Load file template
-  template <class T>
-  static bool Load(const std::string& _rFilename, u32 _Revision, T& _class)
-  {
-    INFO_LOG(COMMON, "ChunkReader: Loading %s", _rFilename.c_str());
-
-    if (!File::Exists(_rFilename))
-      return false;
-
-    // Check file size
-    const u64 fileSize = File::GetSize(_rFilename);
-    static const u64 headerSize = sizeof(SChunkHeader);
-    if (fileSize < headerSize)
-    {
-      ERROR_LOG(COMMON, "ChunkReader: File too small");
-      return false;
-    }
-
-    File::IOFile pFile(_rFilename, "rb");
-    if (!pFile)
-    {
-      ERROR_LOG(COMMON, "ChunkReader: Can't open file for reading");
-      return false;
-    }
-
-    // read the header
-    SChunkHeader header;
-    if (!pFile.ReadArray(&header, 1))
-    {
-      ERROR_LOG(COMMON, "ChunkReader: Bad header size");
-      return false;
-    }
-
-    // Check revision
-    if (header.Revision != _Revision)
-    {
-      ERROR_LOG(COMMON, "ChunkReader: Wrong file revision, got %d expected %d", header.Revision,
-                _Revision);
-      return false;
-    }
-
-    // get size
-    const u32 sz = (u32)(fileSize - headerSize);
-    if (header.ExpectedSize != sz)
-    {
-      ERROR_LOG(COMMON, "ChunkReader: Bad file size, got %d expected %d", sz, header.ExpectedSize);
-      return false;
-    }
-
-    // read the state
-    std::vector<u8> buffer(sz);
-    if (!pFile.ReadArray(&buffer[0], sz))
-    {
-      ERROR_LOG(COMMON, "ChunkReader: Error reading file");
-      return false;
-    }
-
-    u8* ptr = &buffer[0];
-    PointerWrap p(&ptr, PointerWrap::MODE_READ);
-    _class.DoState(p);
-
-    INFO_LOG(COMMON, "ChunkReader: Done loading %s", _rFilename.c_str());
-    return true;
-  }
-
-  // Save file template
-  template <class T>
-  static bool Save(const std::string& _rFilename, u32 _Revision, T& _class)
-  {
-    INFO_LOG(COMMON, "ChunkReader: Writing %s", _rFilename.c_str());
-    File::IOFile pFile(_rFilename, "wb");
-    if (!pFile)
-    {
-      ERROR_LOG(COMMON, "ChunkReader: Error opening file for write");
-      return false;
-    }
-
-    // Get data
-    u8* ptr = nullptr;
-    PointerWrap p(&ptr, PointerWrap::MODE_MEASURE);
-    _class.DoState(p);
-    size_t const sz = (size_t)ptr;
-    std::vector<u8> buffer(sz);
-    ptr = &buffer[0];
-    p.SetMode(PointerWrap::MODE_WRITE);
-    _class.DoState(p);
-
-    // Create header
-    SChunkHeader header;
-    header.Revision = _Revision;
-    header.ExpectedSize = (u32)sz;
-
-    // Write to file
-    if (!pFile.WriteArray(&header, 1))
-    {
-      ERROR_LOG(COMMON, "ChunkReader: Failed writing header");
-      return false;
-    }
-
-    if (!pFile.WriteArray(&buffer[0], sz))
-    {
-      ERROR_LOG(COMMON, "ChunkReader: Failed writing data");
-      return false;
-    }
-
-    INFO_LOG(COMMON, "ChunkReader: Done writing %s", _rFilename.c_str());
-    return true;
-  }
-
-private:
-  struct SChunkHeader
-  {
-    u32 Revision;
-    u32 ExpectedSize;
-  };
 };

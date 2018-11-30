@@ -18,9 +18,6 @@ namespace ciface
 {
 namespace Core
 {
-// Forward declarations
-class DeviceQualifier;
-
 //
 // Device
 //
@@ -42,8 +39,6 @@ public:
   public:
     virtual std::string GetName() const = 0;
     virtual ~Control() {}
-    bool InputGateOn();
-
     virtual Input* ToInput() { return nullptr; }
     virtual Output* ToOutput() { return nullptr; }
   };
@@ -59,15 +54,6 @@ public:
     // things like absolute axes/ absolute mouse position will override this
     virtual bool IsDetectable() { return true; }
     virtual ControlState GetState() const = 0;
-
-    ControlState GetGatedState()
-    {
-      if (InputGateOn())
-        return GetState();
-      else
-        return 0.0;
-    }
-
     Input* ToInput() override { return this; }
   };
 
@@ -81,13 +67,6 @@ public:
   public:
     virtual ~Output() {}
     virtual void SetState(ControlState state) = 0;
-
-    void SetGatedState(ControlState state)
-    {
-      if (InputGateOn())
-        SetState(state);
-    }
-
     Output* ToOutput() override { return this; }
   };
 
@@ -97,7 +76,9 @@ public:
   void SetId(int id) { m_id = id; }
   virtual std::string GetName() const = 0;
   virtual std::string GetSource() const = 0;
+  std::string GetQualifiedName() const;
   virtual void UpdateInput() {}
+  virtual bool IsValid() const { return true; }
   const std::vector<Input*>& Inputs() const { return m_inputs; }
   const std::vector<Output*>& Outputs() const { return m_outputs; }
   Input* FindInput(const std::string& name) const;
@@ -117,6 +98,7 @@ protected:
     }
 
     std::string GetName() const override { return m_low.GetName() + *m_high.GetName().rbegin(); }
+
   private:
     Input& m_low;
     Input& m_high;
@@ -153,8 +135,12 @@ public:
   void FromDevice(const Device* const dev);
   void FromString(const std::string& str);
   std::string ToString() const;
+
   bool operator==(const DeviceQualifier& devq) const;
-  bool operator==(const Device* const dev) const;
+  bool operator!=(const DeviceQualifier& devq) const;
+
+  bool operator==(const Device* dev) const;
+  bool operator!=(const Device* dev) const;
 
   std::string source;
   int cid;
@@ -170,6 +156,8 @@ public:
   std::vector<std::string> GetAllDeviceStrings() const;
   std::string GetDefaultDeviceString() const;
   std::shared_ptr<Device> FindDevice(const DeviceQualifier& devq) const;
+
+  bool HasConnectedDevice(const DeviceQualifier& qualifier) const;
 
 protected:
   mutable std::mutex m_devices_mutex;

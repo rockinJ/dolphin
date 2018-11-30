@@ -11,11 +11,12 @@
 
 // --- Gekko Instruction ---
 
-union UGeckoInstruction {
-  u32 hex;
+union UGeckoInstruction
+{
+  u32 hex = 0;
 
-  UGeckoInstruction(u32 _hex) : hex(_hex) {}
-  UGeckoInstruction() : hex(0) {}
+  UGeckoInstruction() = default;
+  UGeckoInstruction(u32 hex_) : hex(hex_) {}
   struct
   {
     // Record bit
@@ -293,6 +294,23 @@ union UGeckoInstruction {
   };
 };
 
+// Used in implementations of rlwimi, rlwinm, and rlwnm
+inline u32 MakeRotationMask(u32 mb, u32 me)
+{
+  // first make 001111111111111 part
+  const u32 begin = 0xFFFFFFFF >> mb;
+  // then make 000000000001111 part, which is used to flip the bits of the first one
+  const u32 end = 0x7FFFFFFF >> me;
+  // do the bitflip
+  const u32 mask = begin ^ end;
+
+  // and invert if backwards
+  if (me < mb)
+    return ~mask;
+
+  return mask;
+}
+
 //
 // --- Gekko Special Registers ---
 //
@@ -311,26 +329,17 @@ enum EQuantizeType : u32
 };
 
 // GQR Register
-union UGQR {
+union UGQR
+{
   BitField<0, 3, EQuantizeType> st_type;
   BitField<8, 6, u32> st_scale;
   BitField<16, 3, EQuantizeType> ld_type;
   BitField<24, 6, u32> ld_scale;
 
-  u32 Hex;
+  u32 Hex = 0;
 
-  UGQR(u32 _hex) { Hex = _hex; }
-  UGQR() { Hex = 0; }
-};
-
-// FPU Register
-union UFPR {
-  u64 as_u64;
-  s64 as_s64;
-  double d;
-  u32 as_u32[2];
-  s32 as_s32[2];
-  float f[2];
+  UGQR() = default;
+  explicit UGQR(u32 hex_) : Hex{hex_} {}
 };
 
 #define XER_CA_SHIFT 29
@@ -339,7 +348,8 @@ union UFPR {
 #define XER_OV_MASK 1
 #define XER_SO_MASK 2
 // XER
-union UReg_XER {
+union UReg_XER
+{
   struct
   {
     u32 BYTE_COUNT : 7;
@@ -350,14 +360,15 @@ union UReg_XER {
     u32 OV : 1;
     u32 SO : 1;
   };
-  u32 Hex;
+  u32 Hex = 0;
 
-  UReg_XER(u32 _hex) { Hex = _hex; }
-  UReg_XER() { Hex = 0; }
+  UReg_XER() = default;
+  explicit UReg_XER(u32 hex_) : Hex{hex_} {}
 };
 
 // Machine State Register
-union UReg_MSR {
+union UReg_MSR
+{
   struct
   {
     u32 LE : 1;
@@ -381,10 +392,10 @@ union UReg_MSR {
     u32 POW : 1;
     u32 res : 13;
   };
-  u32 Hex;
+  u32 Hex = 0;
 
-  UReg_MSR(u32 _hex) { Hex = _hex; }
-  UReg_MSR() { Hex = 0; }
+  UReg_MSR() = default;
+  explicit UReg_MSR(u32 hex_) : Hex{hex_} {}
 };
 
 #define FPRF_SHIFT 12
@@ -418,7 +429,8 @@ enum FPSCRExceptionFlag : u32
 };
 
 // Floating Point Status and Control Register
-union UReg_FPSCR {
+union UReg_FPSCR
+{
   struct
   {
     // Rounding mode (towards: nearest, zero, +inf, -inf)
@@ -477,14 +489,50 @@ union UReg_FPSCR {
     // Exception summary (sticky)
     u32 FX : 1;
   };
-  u32 Hex;
+  u32 Hex = 0;
 
-  UReg_FPSCR(u32 _hex) { Hex = _hex; }
-  UReg_FPSCR() { Hex = 0; }
+  // The FPSCR's 20th bit (11th from a little endian perspective)
+  // is defined as reserved and set to zero. Attempts to modify it
+  // are ignored by hardware, so we do the same.
+  static constexpr u32 mask = 0xFFFFF7FF;
+
+  UReg_FPSCR() = default;
+  explicit UReg_FPSCR(u32 hex_) : Hex{hex_ & mask} {}
+
+  UReg_FPSCR& operator=(u32 value)
+  {
+    Hex = value & mask;
+    return *this;
+  }
+
+  UReg_FPSCR& operator|=(u32 value)
+  {
+    Hex |= value & mask;
+    return *this;
+  }
+
+  UReg_FPSCR& operator&=(u32 value)
+  {
+    Hex &= value;
+    return *this;
+  }
+
+  UReg_FPSCR& operator^=(u32 value)
+  {
+    Hex ^= value & mask;
+    return *this;
+  }
+
+  void ClearFIFR()
+  {
+    FI = 0;
+    FR = 0;
+  }
 };
 
 // Hardware Implementation-Dependent Register 0
-union UReg_HID0 {
+union UReg_HID0
+{
   struct
   {
     u32 NOOPTI : 1;
@@ -518,11 +566,12 @@ union UReg_HID0 {
     u32 DBP : 1;
     u32 EMCP : 1;
   };
-  u32 Hex;
+  u32 Hex = 0;
 };
 
 // Hardware Implementation-Dependent Register 2
-union UReg_HID2 {
+union UReg_HID2
+{
   struct
   {
     u32 : 16;
@@ -540,14 +589,15 @@ union UReg_HID2 {
     u32 WPE : 1;
     u32 LSQE : 1;
   };
-  u32 Hex;
+  u32 Hex = 0;
 
-  UReg_HID2(u32 _hex) { Hex = _hex; }
-  UReg_HID2() { Hex = 0; }
+  UReg_HID2() = default;
+  explicit UReg_HID2(u32 hex_) : Hex{hex_} {}
 };
 
 // Hardware Implementation-Dependent Register 4
-union UReg_HID4 {
+union UReg_HID4
+{
   struct
   {
     u32 : 20;
@@ -562,14 +612,15 @@ union UReg_HID4 {
     u32 L2FM : 2;
     u32 : 1;
   };
-  u32 Hex;
+  u32 Hex = 0;
 
-  UReg_HID4(u32 _hex) { Hex = _hex; }
-  UReg_HID4() { Hex = 0; }
+  UReg_HID4() = default;
+  explicit UReg_HID4(u32 hex_) : Hex{hex_} {}
 };
 
 // SPR1 - Page Table format
-union UReg_SPR1 {
+union UReg_SPR1
+{
   u32 Hex;
   struct
   {
@@ -580,7 +631,8 @@ union UReg_SPR1 {
 };
 
 // MMCR0 - Monitor Mode Control Register 0 format
-union UReg_MMCR0 {
+union UReg_MMCR0
+{
   u32 Hex;
   struct
   {
@@ -603,7 +655,8 @@ union UReg_MMCR0 {
 };
 
 // MMCR1 - Monitor Mode Control Register 1 format
-union UReg_MMCR1 {
+union UReg_MMCR1
+{
   u32 Hex;
   struct
   {
@@ -614,34 +667,37 @@ union UReg_MMCR1 {
 };
 
 // Write Pipe Address Register
-union UReg_WPAR {
+union UReg_WPAR
+{
   struct
   {
     u32 BNE : 1;
     u32 : 4;
     u32 GB_ADDR : 27;
   };
-  u32 Hex;
+  u32 Hex = 0;
 
-  UReg_WPAR(u32 _hex) { Hex = _hex; }
-  UReg_WPAR() { Hex = 0; }
+  UReg_WPAR() = default;
+  explicit UReg_WPAR(u32 hex_) : Hex{hex_} {}
 };
 
 // Direct Memory Access Upper register
-union UReg_DMAU {
+union UReg_DMAU
+{
   struct
   {
     u32 DMA_LEN_U : 5;
     u32 MEM_ADDR : 27;
   };
-  u32 Hex;
+  u32 Hex = 0;
 
-  UReg_DMAU(u32 _hex) { Hex = _hex; }
-  UReg_DMAU() { Hex = 0; }
+  UReg_DMAU() = default;
+  explicit UReg_DMAU(u32 hex_) : Hex{hex_} {}
 };
 
 // Direct Memory Access Lower (DMAL) register
-union UReg_DMAL {
+union UReg_DMAL
+{
   struct
   {
     u32 DMA_F : 1;
@@ -650,13 +706,14 @@ union UReg_DMAL {
     u32 DMA_LD : 1;
     u32 LC_ADDR : 27;
   };
-  u32 Hex;
+  u32 Hex = 0;
 
-  UReg_DMAL(u32 _hex) { Hex = _hex; }
-  UReg_DMAL() { Hex = 0; }
+  UReg_DMAL() = default;
+  explicit UReg_DMAL(u32 hex_) : Hex{hex_} {}
 };
 
-union UReg_BAT_Up {
+union UReg_BAT_Up
+{
   struct
   {
     u32 VP : 1;
@@ -665,13 +722,14 @@ union UReg_BAT_Up {
     u32 : 4;
     u32 BEPI : 15;
   };
-  u32 Hex;
+  u32 Hex = 0;
 
-  UReg_BAT_Up(u32 _hex) { Hex = _hex; }
-  UReg_BAT_Up() { Hex = 0; }
+  UReg_BAT_Up() = default;
+  explicit UReg_BAT_Up(u32 hex_) : Hex{hex_} {}
 };
 
-union UReg_BAT_Lo {
+union UReg_BAT_Lo
+{
   struct
   {
     u32 PP : 2;
@@ -680,13 +738,14 @@ union UReg_BAT_Lo {
     u32 : 10;
     u32 BRPN : 15;  // Physical Block Number
   };
-  u32 Hex;
+  u32 Hex = 0;
 
-  UReg_BAT_Lo(u32 _hex) { Hex = _hex; }
-  UReg_BAT_Lo() { Hex = 0; }
+  UReg_BAT_Lo() = default;
+  explicit UReg_BAT_Lo(u32 hex_) : Hex{hex_} {}
 };
 
-union UReg_PTE {
+union UReg_PTE
+{
   struct
   {
     u64 API : 6;
@@ -702,7 +761,7 @@ union UReg_PTE {
     u64 RPN : 20;
   };
 
-  u64 Hex;
+  u64 Hex = 0;
   u32 Hex32[2];
 };
 

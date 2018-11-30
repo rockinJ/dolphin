@@ -2,6 +2,9 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include "Core/Debugger/Debugger_SymbolMap.h"
+
+#include <cstdio>
 #include <functional>
 #include <string>
 
@@ -9,8 +12,7 @@
 #include "Common/StringUtil.h"
 
 #include "Core/Core.h"
-#include "Core/Debugger/Debugger_SymbolMap.h"
-#include "Core/HW/Memmap.h"
+#include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PPCAnalyst.h"
 #include "Core/PowerPC/PPCSymbolDB.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -27,7 +29,7 @@ void AddAutoBreakpoints()
 
   for (const char* bp : bps)
   {
-    Symbol* symbol = g_symbolDB.GetSymbolFromName(bp);
+    Common::Symbol* symbol = g_symbolDB.GetSymbolFromName(bp);
     if (symbol)
       PowerPC::breakpoints.Add(symbol->address, false);
   }

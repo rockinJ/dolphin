@@ -2,6 +2,8 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include "Core/HW/DSPHLE/UCodes/ROM.h"
+
 #include <string>
 
 #ifdef _WIN32
@@ -10,24 +12,32 @@
 
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
-#include "Common/FileUtil.h"
 #include "Common/Hash.h"
 #include "Common/Logging/Log.h"
-#include "Common/StringUtil.h"
 #include "Core/ConfigManager.h"
-#include "Core/HW/DSPHLE/UCodes/ROM.h"
+#include "Core/DSP/DSPCodeUtil.h"
+#include "Core/HW/DSPHLE/DSPHLE.h"
+#include "Core/HW/DSPHLE/MailHandler.h"
 #include "Core/HW/DSPHLE/UCodes/UCodes.h"
 
+namespace DSP
+{
+namespace HLE
+{
 ROMUCode::ROMUCode(DSPHLE* dsphle, u32 crc)
     : UCodeInterface(dsphle, crc), m_current_ucode(), m_boot_task_num_steps(0), m_next_parameter(0)
 {
-  DEBUG_LOG(DSPHLE, "UCode_Rom - initialized");
-  m_mail_handler.Clear();
-  m_mail_handler.PushMail(0x8071FEED);
+  INFO_LOG(DSPHLE, "UCode_Rom - initialized");
 }
 
 ROMUCode::~ROMUCode()
 {
+}
+
+void ROMUCode::Initialize()
+{
+  m_mail_handler.Clear();
+  m_mail_handler.PushMail(0x8071FEED);
 }
 
 void ROMUCode::Update()
@@ -91,29 +101,23 @@ void ROMUCode::HandleMail(u32 mail)
 
 void ROMUCode::BootUCode()
 {
-  u32 ector_crc = HashEctor((u8*)HLEMemory_Get_Pointer(m_current_ucode.m_ram_address),
-                            m_current_ucode.m_length);
+  const u32 ector_crc =
+      Common::HashEctor(static_cast<u8*>(HLEMemory_Get_Pointer(m_current_ucode.m_ram_address)),
+                        m_current_ucode.m_length);
 
   if (SConfig::GetInstance().m_DumpUCode)
   {
-    std::string ucode_dump_path =
-        StringFromFormat("%sDSP_UC_%08X.bin", File::GetUserPath(D_DUMPDSP_IDX).c_str(), ector_crc);
-
-    File::IOFile fp(ucode_dump_path, "wb");
-    if (fp)
-    {
-      fp.WriteArray((u8*)HLEMemory_Get_Pointer(m_current_ucode.m_ram_address),
-                    m_current_ucode.m_length);
-    }
+    DSP::DumpDSPCode(static_cast<u8*>(HLEMemory_Get_Pointer(m_current_ucode.m_ram_address)),
+                     m_current_ucode.m_length, ector_crc);
   }
 
-  DEBUG_LOG(DSPHLE, "CurrentUCode SOURCE Addr: 0x%08x", m_current_ucode.m_ram_address);
-  DEBUG_LOG(DSPHLE, "CurrentUCode Length:      0x%08x", m_current_ucode.m_length);
-  DEBUG_LOG(DSPHLE, "CurrentUCode DEST Addr:   0x%08x", m_current_ucode.m_imem_address);
-  DEBUG_LOG(DSPHLE, "CurrentUCode DMEM Length: 0x%08x", m_current_ucode.m_dmem_length);
-  DEBUG_LOG(DSPHLE, "CurrentUCode init_vector: 0x%08x", m_current_ucode.m_start_pc);
-  DEBUG_LOG(DSPHLE, "CurrentUCode CRC:         0x%08x", ector_crc);
-  DEBUG_LOG(DSPHLE, "BootTask - done");
+  INFO_LOG(DSPHLE, "CurrentUCode SOURCE Addr: 0x%08x", m_current_ucode.m_ram_address);
+  INFO_LOG(DSPHLE, "CurrentUCode Length:      0x%08x", m_current_ucode.m_length);
+  INFO_LOG(DSPHLE, "CurrentUCode DEST Addr:   0x%08x", m_current_ucode.m_imem_address);
+  INFO_LOG(DSPHLE, "CurrentUCode DMEM Length: 0x%08x", m_current_ucode.m_dmem_length);
+  INFO_LOG(DSPHLE, "CurrentUCode init_vector: 0x%08x", m_current_ucode.m_start_pc);
+  INFO_LOG(DSPHLE, "CurrentUCode CRC:         0x%08x", ector_crc);
+  INFO_LOG(DSPHLE, "BootTask - done");
 
   m_dsphle->SetUCode(ector_crc);
 }
@@ -126,3 +130,5 @@ void ROMUCode::DoState(PointerWrap& p)
 
   DoStateShared(p);
 }
+}  // namespace HLE
+}  // namespace DSP

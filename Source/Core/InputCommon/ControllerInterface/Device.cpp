@@ -2,18 +2,14 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include "InputCommon/ControllerInterface/Device.h"
+
 #include <memory>
 #include <sstream>
 #include <string>
 #include <tuple>
 
-// For InputGateOn()
-// This is a really bad layering violation, but it's the cleanest
-// place I could find to put it.
-#include "Core/ConfigManager.h"
-#include "Core/Host.h"
-
-#include "InputCommon/ControllerInterface/Device.h"
+#include "Common/StringUtil.h"
 
 namespace ciface
 {
@@ -45,6 +41,11 @@ void Device::AddOutput(Device::Output* const o)
   m_outputs.push_back(o);
 }
 
+std::string Device::GetQualifiedName() const
+{
+  return StringFromFormat("%s/%i/%s", this->GetSource().c_str(), GetId(), this->GetName().c_str());
+}
+
 Device::Input* Device::FindInput(const std::string& name) const
 {
   for (Input* input : m_inputs)
@@ -65,16 +66,6 @@ Device::Output* Device::FindOutput(const std::string& name) const
   }
 
   return nullptr;
-}
-
-bool Device::Control::InputGateOn()
-{
-  if (SConfig::GetInstance().m_BackgroundInput)
-    return true;
-  else if (Host_RendererHasFocus() || Host_UIHasFocus())
-    return true;
-  else
-    return false;
 }
 
 //
@@ -103,15 +94,17 @@ std::string DeviceQualifier::ToString() const
 //
 void DeviceQualifier::FromString(const std::string& str)
 {
+  *this = {};
+
   std::istringstream ss(str);
 
-  std::getline(ss, source = "", '/');
+  std::getline(ss, source, '/');
 
   // silly
   std::getline(ss, name, '/');
-  std::istringstream(name) >> (cid = -1);
+  std::istringstream(name) >> cid;
 
-  std::getline(ss, name = "");
+  std::getline(ss, name);
 }
 
 //
@@ -136,9 +129,19 @@ bool DeviceQualifier::operator==(const Device* const dev) const
   return false;
 }
 
+bool DeviceQualifier::operator!=(const Device* const dev) const
+{
+  return !operator==(dev);
+}
+
 bool DeviceQualifier::operator==(const DeviceQualifier& devq) const
 {
   return std::tie(cid, name, source) == std::tie(devq.cid, devq.name, devq.source);
+}
+
+bool DeviceQualifier::operator!=(const DeviceQualifier& devq) const
+{
+  return !operator==(devq);
 }
 
 std::shared_ptr<Device> DeviceContainer::FindDevice(const DeviceQualifier& devq) const
@@ -204,6 +207,12 @@ Device::Input* DeviceContainer::FindInput(const std::string& name, const Device*
 Device::Output* DeviceContainer::FindOutput(const std::string& name, const Device* def_dev) const
 {
   return def_dev->FindOutput(name);
+}
+
+bool DeviceContainer::HasConnectedDevice(const DeviceQualifier& qualifier) const
+{
+  const auto device = FindDevice(qualifier);
+  return device != nullptr && device->IsValid();
 }
 }
 }

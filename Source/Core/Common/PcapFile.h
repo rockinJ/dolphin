@@ -17,10 +17,11 @@
 #include <memory>
 
 #include "Common/CommonTypes.h"
-#include "Common/FileUtil.h"
-#include "Common/NonCopyable.h"
+#include "Common/File.h"
 
-class PCAP final : public NonCopyable
+namespace Common
+{
+class PCAP final
 {
 public:
   // Takes ownership of the file object. Assumes the file object is already
@@ -39,3 +40,4 @@ private:
 
   std::unique_ptr<File::IOFile> m_fp;
 };
+}  // namespace Common

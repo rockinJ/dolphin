@@ -4,34 +4,41 @@
 
 // Thanks to Treeki for writing the original class - 29/01/2012
 
+#include "Common/SettingsHandler.h"
+
 #include <cstddef>
-#include <cstdio>
-#include <cstring>
 #include <ctime>
+#include <iomanip>
+#include <sstream>
 #include <string>
 
-#ifdef _WIN32
-#include <mmsystem.h>
-#include <sys/timeb.h>
-#include <windows.h>
-#include "Common/CommonFuncs.h"  // snprintf
-#endif
-
 #include "Common/CommonTypes.h"
-#include "Common/SettingsHandler.h"
-#include "Common/Timer.h"
 
+namespace Common
+{
 SettingsHandler::SettingsHandler()
 {
   Reset();
 }
 
-const u8* SettingsHandler::GetData() const
+SettingsHandler::SettingsHandler(Buffer&& buffer)
+{
+  SetBytes(std::move(buffer));
+}
+
+const SettingsHandler::Buffer& SettingsHandler::GetBytes() const
 {
   return m_buffer;
 }
 
-const std::string SettingsHandler::GetValue(const std::string& key)
+void SettingsHandler::SetBytes(Buffer&& buffer)
+{
+  Reset();
+  m_buffer = std::move(buffer);
+  Decrypt();
+}
+
+std::string SettingsHandler::GetValue(const std::string& key) const
 {
   std::string delim = std::string("\r\n");
   std::string toFind = delim + key + "=";
@@ -62,10 +69,10 @@ const std::string SettingsHandler::GetValue(const std::string& key)
 
 void SettingsHandler::Decrypt()
 {
-  const u8* str = m_buffer;
+  const u8* str = m_buffer.data();
   while (*str != 0)
   {
-    if (m_position >= SETTINGS_SIZE)
+    if (m_position >= m_buffer.size())
       return;
     decoded.push_back((u8)(m_buffer[m_position] ^ m_key));
     m_position++;
@@ -79,7 +86,7 @@ void SettingsHandler::Reset()
   decoded = "";
   m_position = 0;
   m_key = INITIAL_SEED;
-  memset(m_buffer, 0, SETTINGS_SIZE);
+  m_buffer = {};
 }
 
 void SettingsHandler::AddSetting(const std::string& key, const std::string& value)
@@ -102,7 +109,7 @@ void SettingsHandler::AddSetting(const std::string& key, const std::string& valu
 
 void SettingsHandler::WriteByte(u8 b)
 {
-  if (m_position >= SETTINGS_SIZE)
+  if (m_position >= m_buffer.size())
     return;
 
   m_buffer[m_position] = b ^ m_key;
@@ -110,18 +117,15 @@ void SettingsHandler::WriteByte(u8 b)
   m_key = (m_key >> 31) | (m_key << 1);
 }
 
-const std::string SettingsHandler::generateSerialNumber()
+std::string SettingsHandler::GenerateSerialNumber()
 {
-  time_t rawtime;
-  tm* timeinfo;
-  char buffer[12];
-  char serialNumber[12];
+  const std::time_t t = std::time(nullptr);
 
-  time(&rawtime);
-  timeinfo = localtime(&rawtime);
-  strftime(buffer, 11, "%j%H%M%S", timeinfo);
-
-  snprintf(serialNumber, 11, "%s%i", buffer, (Common::Timer::GetTimeMs() >> 1) & 0xF);
-  serialNumber[10] = 0;
-  return std::string(serialNumber);
+  // Must be 9 characters at most; otherwise the serial number will be rejected by SDK libraries,
+  // as there is a check to ensure the string length is strictly lower than 10.
+  // 3 for %j, 2 for %H, 2 for %M, 2 for %S.
+  std::stringstream stream;
+  stream << std::put_time(std::localtime(&t), "%j%H%M%S");
+  return stream.str();
 }
+}  // namespace Common

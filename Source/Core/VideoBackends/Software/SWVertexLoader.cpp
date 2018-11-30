@@ -2,17 +2,18 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include "VideoBackends/Software/SWVertexLoader.h"
+
+#include <cstddef>
 #include <limits>
 
-#include "Common/ChunkFile.h"
+#include "Common/Assert.h"
 #include "Common/CommonTypes.h"
+#include "Common/Logging/Log.h"
 
-#include "VideoBackends/Software/Clipper.h"
 #include "VideoBackends/Software/DebugUtil.h"
 #include "VideoBackends/Software/NativeVertexFormat.h"
 #include "VideoBackends/Software/Rasterizer.h"
-#include "VideoBackends/Software/SWVertexLoader.h"
-#include "VideoBackends/Software/SetupUnit.h"
 #include "VideoBackends/Software/Tev.h"
 #include "VideoBackends/Software/TransformUnit.h"
 
@@ -30,55 +31,52 @@ class NullNativeVertexFormat : public NativeVertexFormat
 {
 public:
   NullNativeVertexFormat(const PortableVertexDeclaration& _vtx_decl) { vtx_decl = _vtx_decl; }
-  void SetupVertexPointers() override {}
 };
 
-NativeVertexFormat*
+std::unique_ptr<NativeVertexFormat>
 SWVertexLoader::CreateNativeVertexFormat(const PortableVertexDeclaration& vtx_decl)
 {
-  return new NullNativeVertexFormat(vtx_decl);
+  return std::make_unique<NullNativeVertexFormat>(vtx_decl);
 }
 
 SWVertexLoader::SWVertexLoader()
+    : m_local_vertex_buffer(MAXVBUFFERSIZE), m_local_index_buffer(MAXIBUFFERSIZE)
 {
-  LocalVBuffer.resize(MAXVBUFFERSIZE);
-  LocalIBuffer.resize(MAXIBUFFERSIZE);
-  m_SetupUnit = new SetupUnit;
 }
 
 SWVertexLoader::~SWVertexLoader()
 {
-  delete m_SetupUnit;
-  m_SetupUnit = nullptr;
 }
 
 void SWVertexLoader::ResetBuffer(u32 stride)
 {
-  s_pCurBufferPointer = s_pBaseBufferPointer = LocalVBuffer.data();
-  s_pEndBufferPointer = s_pCurBufferPointer + LocalVBuffer.size();
-  IndexGenerator::Start(GetIndexBuffer());
+  m_cur_buffer_pointer = m_base_buffer_pointer = m_local_vertex_buffer.data();
+  m_end_buffer_pointer = m_cur_buffer_pointer + m_local_vertex_buffer.size();
+  IndexGenerator::Start(m_local_index_buffer.data());
 }
 
-void SWVertexLoader::vFlush(bool useDstAlpha)
+void SWVertexLoader::vFlush()
 {
   DebugUtil::OnObjectBegin();
 
   u8 primitiveType = 0;
-  switch (current_primitive_type)
+  switch (m_current_primitive_type)
   {
-  case PRIMITIVE_POINTS:
-    primitiveType = GX_DRAW_POINTS;
+  case PrimitiveType::Points:
+    primitiveType = OpcodeDecoder::GX_DRAW_POINTS;
     break;
-  case PRIMITIVE_LINES:
-    primitiveType = GX_DRAW_LINES;
+  case PrimitiveType::Lines:
+    primitiveType = OpcodeDecoder::GX_DRAW_LINES;
     break;
-  case PRIMITIVE_TRIANGLES:
-    primitiveType = g_ActiveConfig.backend_info.bSupportsPrimitiveRestart ? GX_DRAW_TRIANGLE_STRIP :
-                                                                            GX_DRAW_TRIANGLES;
+  case PrimitiveType::Triangles:
+    primitiveType = OpcodeDecoder::GX_DRAW_TRIANGLES;
+    break;
+  case PrimitiveType::TriangleStrip:
+    primitiveType = OpcodeDecoder::GX_DRAW_TRIANGLE_STRIP;
     break;
   }
 
-  m_SetupUnit->Init(primitiveType);
+  m_setup_unit.Init(primitiveType);
 
   // set all states with are stored within video sw
   for (int i = 0; i < 4; i++)
@@ -91,37 +89,30 @@ void SWVertexLoader::vFlush(bool useDstAlpha)
 
   for (u32 i = 0; i < IndexGenerator::GetIndexLen(); i++)
   {
-    u16 index = LocalIBuffer[i];
-
-    if (index == 0xffff)
-    {
-      // primitive restart
-      m_SetupUnit->Init(primitiveType);
-      continue;
-    }
-    memset(&m_Vertex, 0, sizeof(m_Vertex));
+    const u16 index = m_local_index_buffer[i];
+    memset(static_cast<void*>(&m_vertex), 0, sizeof(m_vertex));
 
     // Super Mario Sunshine requires those to be zero for those debug boxes.
-    memset(&m_Vertex.color, 0, sizeof(m_Vertex.color));
+    m_vertex.color = {};
 
-    // parse the videocommon format to our own struct format (m_Vertex)
+    // parse the videocommon format to our own struct format (m_vertex)
     SetFormat(g_main_cp_state.last_id, primitiveType);
     ParseVertex(VertexLoaderManager::GetCurrentVertexFormat()->GetVertexDeclaration(), index);
 
     // transform this vertex so that it can be used for rasterization (outVertex)
-    OutputVertexData* outVertex = m_SetupUnit->GetVertex();
-    TransformUnit::TransformPosition(&m_Vertex, outVertex);
-    memset(&outVertex->normal, 0, sizeof(outVertex->normal));
+    OutputVertexData* outVertex = m_setup_unit.GetVertex();
+    TransformUnit::TransformPosition(&m_vertex, outVertex);
+    outVertex->normal = {};
     if (VertexLoaderManager::g_current_components & VB_HAS_NRM0)
     {
       TransformUnit::TransformNormal(
-          &m_Vertex, (VertexLoaderManager::g_current_components & VB_HAS_NRM2) != 0, outVertex);
+          &m_vertex, (VertexLoaderManager::g_current_components & VB_HAS_NRM2) != 0, outVertex);
     }
-    TransformUnit::TransformColor(&m_Vertex, outVertex);
-    TransformUnit::TransformTexCoord(&m_Vertex, outVertex, m_TexGenSpecialCase);
+    TransformUnit::TransformColor(&m_vertex, outVertex);
+    TransformUnit::TransformTexCoord(&m_vertex, outVertex, m_tex_gen_special_case);
 
     // assemble and rasterize the primitive
-    m_SetupUnit->SetupVertex();
+    m_setup_unit.SetupVertex();
 
     INCSTAT(stats.thisFrame.numVerticesLoaded)
   }
@@ -145,20 +136,20 @@ void SWVertexLoader::SetFormat(u8 attributeIndex, u8 primitiveType)
     ERROR_LOG(VIDEO, "Matrix indices don't match");
   }
 
-  m_Vertex.posMtx = xfmem.MatrixIndexA.PosNormalMtxIdx;
-  m_Vertex.texMtx[0] = xfmem.MatrixIndexA.Tex0MtxIdx;
-  m_Vertex.texMtx[1] = xfmem.MatrixIndexA.Tex1MtxIdx;
-  m_Vertex.texMtx[2] = xfmem.MatrixIndexA.Tex2MtxIdx;
-  m_Vertex.texMtx[3] = xfmem.MatrixIndexA.Tex3MtxIdx;
-  m_Vertex.texMtx[4] = xfmem.MatrixIndexB.Tex4MtxIdx;
-  m_Vertex.texMtx[5] = xfmem.MatrixIndexB.Tex5MtxIdx;
-  m_Vertex.texMtx[6] = xfmem.MatrixIndexB.Tex6MtxIdx;
-  m_Vertex.texMtx[7] = xfmem.MatrixIndexB.Tex7MtxIdx;
+  m_vertex.posMtx = xfmem.MatrixIndexA.PosNormalMtxIdx;
+  m_vertex.texMtx[0] = xfmem.MatrixIndexA.Tex0MtxIdx;
+  m_vertex.texMtx[1] = xfmem.MatrixIndexA.Tex1MtxIdx;
+  m_vertex.texMtx[2] = xfmem.MatrixIndexA.Tex2MtxIdx;
+  m_vertex.texMtx[3] = xfmem.MatrixIndexA.Tex3MtxIdx;
+  m_vertex.texMtx[4] = xfmem.MatrixIndexB.Tex4MtxIdx;
+  m_vertex.texMtx[5] = xfmem.MatrixIndexB.Tex5MtxIdx;
+  m_vertex.texMtx[6] = xfmem.MatrixIndexB.Tex6MtxIdx;
+  m_vertex.texMtx[7] = xfmem.MatrixIndexB.Tex7MtxIdx;
 
   // special case if only pos and tex coord 0 and tex coord input is AB11
   // http://libogc.devkitpro.org/gx_8h.html#a55a426a3ff796db584302bddd829f002
-  m_TexGenSpecialCase = VertexLoaderManager::g_current_components == VB_HAS_UV0 &&
-                        xfmem.texMtxInfo[0].projection == XF_TEXPROJ_ST;
+  m_tex_gen_special_case = VertexLoaderManager::g_current_components == VB_HAS_UV0 &&
+                           xfmem.texMtxInfo[0].projection == XF_TEXPROJ_ST;
 }
 
 template <typename T, typename I>
@@ -205,8 +196,8 @@ static void ReadVertexAttribute(T* dst, DataReader src, const AttributeFormat& f
         break;
       }
 
-      _assert_msg_(VIDEO, !format.integer || format.type != VAR_FLOAT,
-                   "only non-float values are allowed to be streamed as integer");
+      ASSERT_MSG(VIDEO, !format.integer || format.type != VAR_FLOAT,
+                 "only non-float values are allowed to be streamed as integer");
     }
     for (; i < components; i++)
     {
@@ -218,31 +209,32 @@ static void ReadVertexAttribute(T* dst, DataReader src, const AttributeFormat& f
 
 void SWVertexLoader::ParseVertex(const PortableVertexDeclaration& vdec, int index)
 {
-  DataReader src(LocalVBuffer.data(), LocalVBuffer.data() + LocalVBuffer.size());
+  DataReader src(m_local_vertex_buffer.data(),
+                 m_local_vertex_buffer.data() + m_local_vertex_buffer.size());
   src.Skip(index * vdec.stride);
 
-  ReadVertexAttribute<float>(&m_Vertex.position[0], src, vdec.position, 0, 3, false);
+  ReadVertexAttribute<float>(&m_vertex.position[0], src, vdec.position, 0, 3, false);
 
-  for (int i = 0; i < 3; i++)
+  for (std::size_t i = 0; i < m_vertex.normal.size(); i++)
   {
-    ReadVertexAttribute<float>(&m_Vertex.normal[i][0], src, vdec.normals[i], 0, 3, false);
+    ReadVertexAttribute<float>(&m_vertex.normal[i][0], src, vdec.normals[i], 0, 3, false);
   }
 
-  for (int i = 0; i < 2; i++)
+  for (std::size_t i = 0; i < m_vertex.color.size(); i++)
   {
-    ReadVertexAttribute<u8>(m_Vertex.color[i], src, vdec.colors[i], 0, 4, true);
+    ReadVertexAttribute<u8>(m_vertex.color[i].data(), src, vdec.colors[i], 0, 4, true);
   }
 
-  for (int i = 0; i < 8; i++)
+  for (std::size_t i = 0; i < m_vertex.texCoords.size(); i++)
   {
-    ReadVertexAttribute<float>(m_Vertex.texCoords[i], src, vdec.texcoords[i], 0, 2, false);
+    ReadVertexAttribute<float>(m_vertex.texCoords[i].data(), src, vdec.texcoords[i], 0, 2, false);
 
     // the texmtr is stored as third component of the texCoord
     if (vdec.texcoords[i].components >= 3)
     {
-      ReadVertexAttribute<u8>(&m_Vertex.texMtx[i], src, vdec.texcoords[i], 2, 1, false);
+      ReadVertexAttribute<u8>(&m_vertex.texMtx[i], src, vdec.texcoords[i], 2, 1, false);
     }
   }
 
-  ReadVertexAttribute<u8>(&m_Vertex.posMtx, src, vdec.posmtx, 0, 1, false);
+  ReadVertexAttribute<u8>(&m_vertex.posMtx, src, vdec.posmtx, 0, 1, false);
 }

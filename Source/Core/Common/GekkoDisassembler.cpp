@@ -38,6 +38,8 @@
 #include "Common/GekkoDisassembler.h"
 #include "Common/StringUtil.h"
 
+namespace Common
+{
 // version/revision
 #define PPCDISASM_VER 1
 #define PPCDISASM_REV 6
@@ -907,12 +909,12 @@ void GekkoDisassembler::fdabc(u32 in, const char* name, int mask, unsigned char 
 
   if (mask & 4)
     m_operands += StringFromFormat("f%d,", (int)PPCGETA(in));
-  else
+  else if ((mask & 8) == 0)
     err |= (int)PPCGETA(in);
 
   if (mask & 2)
     m_operands += StringFromFormat("f%d,", (int)PPCGETC(in));
-  else if (PPCGETC(in))
+  else if (PPCGETC(in) && (mask & 8) == 0)
     err |= (int)PPCGETC(in);
 
   if (mask & 1)
@@ -967,7 +969,7 @@ void GekkoDisassembler::mtfsb(u32 in, int n)
   }
 }
 
-// Paired instructions
+  // Paired instructions
 
 #define RA ((inst >> 16) & 0x1f)
 #define RB ((inst >> 11) & 0x1f)
@@ -1179,6 +1181,7 @@ void GekkoDisassembler::ps(u32 inst)
       ill(inst);
     else
       dab(inst, "dcbz_l", 3, 0, 0, 0, 0);
+    return;
   }
 
   //	default:
@@ -2193,7 +2196,7 @@ u32* GekkoDisassembler::DoDisassembly(bool big_endian)
         break;
 
       case 40:
-        fdabc(in, "neg", 10, 0);
+        fdabc(in, "neg", 9, 0);
         break;
 
       case 64:
@@ -2221,11 +2224,11 @@ u32* GekkoDisassembler::DoDisassembly(bool big_endian)
         break;
 
       case 136:
-        fdabc(in, "nabs", 10, 0);
+        fdabc(in, "nabs", 9, 0);
         break;
 
       case 264:
-        fdabc(in, "abs", 10, 0);
+        fdabc(in, "abs", 9, 0);
         break;
 
       case 583:
@@ -2239,8 +2242,7 @@ u32* GekkoDisassembler::DoDisassembly(bool big_endian)
         if ((in & 0x02010000) == 0)
         {
           m_opcode = StringFromFormat("mtfsf%s", rcsel[in & 1]);
-          m_operands = StringFromFormat("0x%x,%u", (unsigned int)(in >> 17) & 0x01fe,
-                                        (unsigned int)PPCGETB(in));
+          m_operands = StringFromFormat("0x%x, f%u", (in >> 17) & 0xff, PPCGETB(in));
         }
         else
         {
@@ -2249,15 +2251,15 @@ u32* GekkoDisassembler::DoDisassembly(bool big_endian)
         break;
 
       case 814:
-        fdabc(in, "fctid", 10, PPCF_64);
+        fdabc(in, "fctid", 9, PPCF_64);
         break;
 
       case 815:
-        fdabc(in, "fctidz", 10, PPCF_64);
+        fdabc(in, "fctidz", 9, PPCF_64);
         break;
 
       case 846:
-        fdabc(in, "fcfid", 10, PPCF_64);
+        fdabc(in, "fcfid", 9, PPCF_64);
         break;
 
       default:
@@ -2289,10 +2291,10 @@ std::string GekkoDisassembler::Disassemble(u32 opcode, u32 current_instruction_a
   return m_opcode.append("\t").append(m_operands);
 }
 
-static const char* gprnames[] = {" r0", " r1", " r2", " r3", " r4", " r5", " r6", " r7",
-                                 " r8", " r9", "r10", "r11", "r12", "r13", "r14", "r15",
-                                 "r16", "r17", "r18", "r19", "r20", "r21", "r22", "r23",
-                                 "r24", "r25", "r26", "r27", "r28", "r29", "r30", "r31"};
+static const char* gprnames[] = {
+    " r0", " r1 (sp)", " r2 (rtoc)", " r3", " r4", " r5", " r6", " r7", " r8", " r9", "r10",
+    "r11", "r12",      "r13",        "r14", "r15", "r16", "r17", "r18", "r19", "r20", "r21",
+    "r22", "r23",      "r24",        "r25", "r26", "r27", "r28", "r29", "r30", "r31"};
 
 const char* GekkoDisassembler::GetGPRName(u32 index)
 {
@@ -2314,3 +2316,4 @@ const char* GekkoDisassembler::GetFPRName(u32 index)
 
   return nullptr;
 }
+}  // namespace Common

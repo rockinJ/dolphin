@@ -1,16 +1,29 @@
 package org.dolphinemu.dolphinemu.adapters;
 
-import android.graphics.Bitmap;
+import android.app.AlertDialog;
+import android.content.Context;
+import android.content.DialogInterface;
+import android.graphics.drawable.Drawable;
 import android.support.v17.leanback.widget.ImageCardView;
 import android.support.v17.leanback.widget.Presenter;
+import android.support.v4.app.FragmentActivity;
+import android.support.v4.content.ContextCompat;
+import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ImageView;
-
-import com.squareup.picasso.Picasso;
+import android.widget.Toast;
 
 import org.dolphinemu.dolphinemu.R;
-import org.dolphinemu.dolphinemu.model.Game;
+import org.dolphinemu.dolphinemu.dialogs.GameSettingsDialog;
+import org.dolphinemu.dolphinemu.features.settings.ui.MenuTag;
+import org.dolphinemu.dolphinemu.features.settings.ui.SettingsActivity;
+import org.dolphinemu.dolphinemu.model.GameFile;
+import org.dolphinemu.dolphinemu.utils.DirectoryInitialization;
+import org.dolphinemu.dolphinemu.ui.platform.Platform;
+import org.dolphinemu.dolphinemu.utils.PicassoUtils;
 import org.dolphinemu.dolphinemu.viewholders.TvGameViewHolder;
+
+import java.io.File;
 
 /**
  * The Leanback library / docs call this a Presenter, but it works very
@@ -18,101 +31,83 @@ import org.dolphinemu.dolphinemu.viewholders.TvGameViewHolder;
  */
 public final class GameRowPresenter extends Presenter
 {
-	public ViewHolder onCreateViewHolder(ViewGroup parent)
-	{
-		// Create a new view.
-		ImageCardView gameCard = new ImageCardView(parent.getContext())
-		{
-			@Override
-			public void setSelected(boolean selected)
-			{
-				setCardBackground(this, selected);
-				super.setSelected(selected);
-			}
-		};
+  @Override
+  public ViewHolder onCreateViewHolder(ViewGroup parent)
+  {
+    // Create a new view.
+    ImageCardView gameCard = new ImageCardView(parent.getContext());
 
-		gameCard.setMainImageAdjustViewBounds(true);
-		gameCard.setMainImageDimensions(480, 320);
-		gameCard.setMainImageScaleType(ImageView.ScaleType.CENTER_CROP);
+    gameCard.setMainImageAdjustViewBounds(true);
+    gameCard.setMainImageDimensions(240, 336);
+    gameCard.setMainImageScaleType(ImageView.ScaleType.CENTER_CROP);
 
-		gameCard.setFocusable(true);
-		gameCard.setFocusableInTouchMode(true);
+    gameCard.setFocusable(true);
+    gameCard.setFocusableInTouchMode(true);
 
-		setCardBackground(gameCard, false);
+    // Use that view to create a ViewHolder.
+    return new TvGameViewHolder(gameCard);
+  }
 
-		// Use that view to create a ViewHolder.
-		return new TvGameViewHolder(gameCard);
-	}
+  @Override
+  public void onBindViewHolder(ViewHolder viewHolder, Object item)
+  {
+    TvGameViewHolder holder = (TvGameViewHolder) viewHolder;
+    GameFile gameFile = (GameFile) item;
 
-	public void onBindViewHolder(ViewHolder viewHolder, Object item)
-	{
-		TvGameViewHolder holder = (TvGameViewHolder) viewHolder;
-		Game game = (Game) item;
+    holder.imageScreenshot.setImageDrawable(null);
+    PicassoUtils.loadGameBanner(holder.imageScreenshot, gameFile);
 
-		String screenPath = game.getScreenshotPath();
+    holder.cardParent.setTitleText(gameFile.getTitle());
+    holder.cardParent.setContentText(gameFile.getCompany());
 
-		// Fill in the view contents.
-		Picasso.with(holder.imageScreenshot.getContext())
-				.load(screenPath)
-				.fit()
-				.centerCrop()
-				.noFade()
-				.noPlaceholder()
-				.config(Bitmap.Config.RGB_565)
-				.error(R.drawable.no_banner)
-				.into(holder.imageScreenshot);
+    holder.gameFile = gameFile;
 
-		holder.cardParent.setTitleText(game.getTitle());
-		holder.cardParent.setContentText(game.getCompany());
+    // Set the platform-dependent background color of the card
+    int backgroundId;
+    switch (Platform.fromNativeInt(gameFile.getPlatform()))
+    {
+      case GAMECUBE:
+        backgroundId = R.drawable.tv_card_background_gamecube;
+        break;
+      case WII:
+        backgroundId = R.drawable.tv_card_background_wii;
+        break;
+      case WIIWARE:
+        backgroundId = R.drawable.tv_card_background_wiiware;
+        break;
+      default:
+        throw new AssertionError("Not reachable.");
+    }
+    Context context = holder.cardParent.getContext();
+    Drawable background = ContextCompat.getDrawable(context, backgroundId);
+    holder.cardParent.setInfoAreaBackground(background);
+    holder.cardParent.setOnLongClickListener((view) ->
+    {
+      FragmentActivity activity = (FragmentActivity) view.getContext();
+      String gameId = gameFile.getGameId();
 
-		// TODO These shouldn't be necessary once the move to a DB-based model is complete.
-		holder.gameId = game.getGameId();
-		holder.path = game.getPath();
-		holder.title = game.getTitle();
-		holder.description = game.getDescription();
-		holder.country = game.getCountry();
-		holder.company = game.getCompany();
-		holder.screenshotPath = game.getScreenshotPath();
+      if (gameId.isEmpty())
+      {
+        AlertDialog.Builder builder = new AlertDialog.Builder(activity);
+        builder.setTitle("Game Settings");
+        builder.setMessage("Files without game IDs don't support game-specific settings.");
 
-		switch (game.getPlatform())
-		{
-			case Game.PLATFORM_GC:
-				holder.cardParent.setTag(R.color.dolphin_accent_gamecube);
-				break;
+        builder.show();
+        return true;
+      }
 
-			case Game.PLATFORM_WII:
-				holder.cardParent.setTag(R.color.dolphin_accent_wii);
-				break;
+      GameSettingsDialog fragment =
+              GameSettingsDialog.newInstance(gameId, holder.gameFile.getPlatform());
+      ((FragmentActivity) view.getContext()).getSupportFragmentManager().beginTransaction()
+              .add(fragment, GameSettingsDialog.TAG).commit();
 
-			case Game.PLATFORM_WII_WARE:
-				holder.cardParent.setTag(R.color.dolphin_accent_wiiware);
-				break;
+      return true;
+    });
+  }
 
-			default:
-				holder.cardParent.setTag(android.R.color.holo_red_dark);
-				break;
-		}
-	}
-
-	public void onUnbindViewHolder(ViewHolder viewHolder)
-	{
-		// no op
-	}
-
-	public void setCardBackground(ImageCardView view, boolean selected)
-	{
-		int backgroundColor;
-
-		if (selected)
-		{
-			// TODO: 7/20/15 Try using view tag to set color
-			backgroundColor = (int) view.getTag();
-		}
-		else
-		{
-			backgroundColor = R.color.tv_card_unselected;
-		}
-
-		view.setInfoAreaBackgroundColor(view.getResources().getColor(backgroundColor));
-	}
+  @Override
+  public void onUnbindViewHolder(ViewHolder viewHolder)
+  {
+    // no op
+  }
 }

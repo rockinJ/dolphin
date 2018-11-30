@@ -1,23 +1,19 @@
 // This file is public domain, in case it's useful to anyone. -comex
 
 #include "Common/TraversalClient.h"
+
+#include <cstddef>
+#include <cstring>
+#include <string>
+
+#include "Common/CommonTypes.h"
 #include "Common/Logging/Log.h"
 #include "Common/MsgHandler.h"
-#include "Common/Timer.h"
-
-static void GetRandomishBytes(u8* buf, size_t size)
-{
-  // We don't need high quality random numbers (which might not be available),
-  // just non-repeating numbers!
-  static std::mt19937 prng(enet_time_get());
-  static std::uniform_int_distribution<unsigned int> u8_distribution(0, 255);
-  for (size_t i = 0; i < size; i++)
-    buf[i] = u8_distribution(prng);
-}
+#include "Common/Random.h"
+#include "Core/NetPlayProto.h"
 
 TraversalClient::TraversalClient(ENetHost* netHost, const std::string& server, const u16 port)
-    : m_NetHost(netHost), m_Client(nullptr), m_FailureReason(0), m_ConnectRequestId(0),
-      m_PendingConnect(false), m_Server(server), m_port(port), m_PingTime(0)
+    : m_NetHost(netHost), m_Server(server), m_port(port)
 {
   netHost->intercept = TraversalClient::InterceptCallback;
 
@@ -26,15 +22,28 @@ TraversalClient::TraversalClient(ENetHost* netHost, const std::string& server, c
   ReconnectToServer();
 }
 
-TraversalClient::~TraversalClient()
+TraversalClient::~TraversalClient() = default;
+
+TraversalHostId TraversalClient::GetHostID() const
 {
+  return m_HostId;
+}
+
+TraversalClient::State TraversalClient::GetState() const
+{
+  return m_State;
+}
+
+TraversalClient::FailureReason TraversalClient::GetFailureReason() const
+{
+  return m_FailureReason;
 }
 
 void TraversalClient::ReconnectToServer()
 {
   if (enet_address_set_host(&m_ServerAddress, m_Server.c_str()))
   {
-    OnFailure(BadHost);
+    OnFailure(FailureReason::BadHost);
     return;
   }
   m_ServerAddress.port = m_port;
@@ -123,7 +132,7 @@ void TraversalClient::HandleServerPacket(TraversalPacket* packet)
   case TraversalPacketAck:
     if (!packet->ack.ok)
     {
-      OnFailure(ServerForgotAboutUs);
+      OnFailure(FailureReason::ServerForgotAboutUs);
       break;
     }
     for (auto it = m_OutgoingTraversalPackets.begin(); it != m_OutgoingTraversalPackets.end(); ++it)
@@ -140,7 +149,7 @@ void TraversalClient::HandleServerPacket(TraversalPacket* packet)
       break;
     if (!packet->helloFromServer.ok)
     {
-      OnFailure(VersionTooOld);
+      OnFailure(FailureReason::VersionTooOld);
       break;
     }
     m_HostId = packet->helloFromServer.yourHostId;
@@ -199,7 +208,7 @@ void TraversalClient::HandleServerPacket(TraversalPacket* packet)
     buf.data = &ack;
     buf.dataLength = sizeof(ack);
     if (enet_socket_send(m_NetHost->socket, &m_ServerAddress, &buf, 1) == -1)
-      OnFailure(SocketSendError);
+      OnFailure(FailureReason::SocketSendError);
   }
 }
 
@@ -220,19 +229,19 @@ void TraversalClient::ResendPacket(OutgoingTraversalPacketInfo* info)
   buf.data = &info->packet;
   buf.dataLength = sizeof(info->packet);
   if (enet_socket_send(m_NetHost->socket, &m_ServerAddress, &buf, 1) == -1)
-    OnFailure(SocketSendError);
+    OnFailure(FailureReason::SocketSendError);
 }
 
 void TraversalClient::HandleResends()
 {
-  enet_uint32 now = enet_time_get();
+  const u32 now = enet_time_get();
   for (auto& tpi : m_OutgoingTraversalPackets)
   {
     if (now - tpi.sendTime >= (u32)(300 * tpi.tries))
     {
       if (tpi.tries >= 5)
       {
-        OnFailure(ResendTimeout);
+        OnFailure(FailureReason::ResendTimeout);
         m_OutgoingTraversalPackets.clear();
         break;
       }
@@ -247,7 +256,7 @@ void TraversalClient::HandleResends()
 
 void TraversalClient::HandlePing()
 {
-  enet_uint32 now = enet_time_get();
+  const u32 now = enet_time_get();
   if (m_State == Connected && now - m_PingTime >= 500)
   {
     TraversalPacket ping = {};
@@ -262,7 +271,7 @@ TraversalRequestId TraversalClient::SendTraversalPacket(const TraversalPacket& p
 {
   OutgoingTraversalPacketInfo info;
   info.packet = packet;
-  GetRandomishBytes((u8*)&info.packet.requestId, sizeof(info.packet.requestId));
+  info.packet.requestId = Common::Random::GenerateValue<TraversalRequestId>();
   info.tries = 0;
   m_OutgoingTraversalPackets.push_back(info);
   ResendPacket(&m_OutgoingTraversalPackets.back());
@@ -308,11 +317,11 @@ bool EnsureTraversalClient(const std::string& server, u16 server_port, u16 liste
     g_OldListenPort = listen_port;
 
     ENetAddress addr = {ENET_HOST_ANY, listen_port};
-    ENetHost* host = enet_host_create(&addr,  // address
-                                      50,     // peerCount
-                                      1,      // channelLimit
-                                      0,      // incomingBandwidth
-                                      0);     // outgoingBandwidth
+    ENetHost* host = enet_host_create(&addr,                   // address
+                                      50,                      // peerCount
+                                      NetPlay::CHANNEL_COUNT,  // channelLimit
+                                      0,                       // incomingBandwidth
+                                      0);                      // outgoingBandwidth
     if (!host)
     {
       g_MainNetHost.reset();
@@ -329,6 +338,6 @@ void ReleaseTraversalClient()
   if (!g_TraversalClient)
     return;
 
-  g_TraversalClient.release();
-  g_MainNetHost.release();
+  g_TraversalClient.reset();
+  g_MainNetHost.reset();
 }

@@ -6,20 +6,16 @@
 
 #pragma once
 
-#include <signal.h>
-
 #include "Common/CommonTypes.h"
-#include "Common/Thread.h"
 
-#include "Core/HW/CPU.h"
-#include "Core/HW/Memmap.h"
-#include "Core/PowerPC/PowerPC.h"
-
-#ifdef _WIN32
-#define SIGTRAP 5
-#define SIGTERM 15
-#define MSG_WAITALL 8
+#if defined(_WIN32) || !defined(MSG_WAITALL)
+#define MSG_WAITALL (8)
 #endif
+
+typedef enum {
+  GDB_SIGTRAP = 5,
+  GDB_SIGTERM = 15,
+} gdb_signals;
 
 typedef enum {
   GDB_BP_TYPE_NONE = 0,

@@ -6,15 +6,16 @@
 
 #pragma once
 
+#include <array>
 #include <string>
 
 #include "Common/CommonTypes.h"
 
+namespace Common
+{
 class SettingsHandler
 {
 public:
-  SettingsHandler();
-
   enum
   {
     SETTINGS_SIZE = 0x100,
@@ -22,19 +23,25 @@ public:
     INITIAL_SEED = 0x73B5DBFA
   };
 
+  using Buffer = std::array<u8, SETTINGS_SIZE>;
+  SettingsHandler();
+  explicit SettingsHandler(Buffer&& buffer);
+
   void AddSetting(const std::string& key, const std::string& value);
 
-  const u8* GetData() const;
-  const std::string GetValue(const std::string& key);
+  const Buffer& GetBytes() const;
+  void SetBytes(Buffer&& buffer);
+  std::string GetValue(const std::string& key) const;
 
   void Decrypt();
   void Reset();
-  const std::string generateSerialNumber();
+  static std::string GenerateSerialNumber();
 
 private:
   void WriteByte(u8 b);
 
-  u8 m_buffer[SETTINGS_SIZE];
+  std::array<u8, SETTINGS_SIZE> m_buffer;
   u32 m_position, m_key;
   std::string decoded;
 };
+}  // namespace Common

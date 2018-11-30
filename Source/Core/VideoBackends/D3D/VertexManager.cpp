@@ -2,20 +2,25 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include "VideoBackends/D3D/VertexManager.h"
+
+#include <d3d11.h>
+
 #include "Common/CommonTypes.h"
 
 #include "VideoBackends/D3D/BoundingBox.h"
 #include "VideoBackends/D3D/D3DBase.h"
 #include "VideoBackends/D3D/D3DState.h"
+#include "VideoBackends/D3D/FramebufferManager.h"
 #include "VideoBackends/D3D/GeometryShaderCache.h"
 #include "VideoBackends/D3D/PixelShaderCache.h"
 #include "VideoBackends/D3D/Render.h"
-#include "VideoBackends/D3D/VertexManager.h"
 #include "VideoBackends/D3D/VertexShaderCache.h"
 
 #include "VideoCommon/BoundingBox.h"
 #include "VideoCommon/Debugger.h"
 #include "VideoCommon/IndexGenerator.h"
+#include "VideoCommon/NativeVertexFormat.h"
 #include "VideoCommon/RenderBase.h"
 #include "VideoCommon/Statistics.h"
 #include "VideoCommon/VertexLoaderManager.h"
@@ -42,7 +47,7 @@ void VertexManager::CreateDeviceObjects()
     m_buffers[i] = nullptr;
     CHECK(SUCCEEDED(D3D::device->CreateBuffer(&bufdesc, nullptr, &m_buffers[i])),
           "Failed to create buffer.");
-    D3D::SetDebugObjectName((ID3D11DeviceChild*)m_buffers[i], "Buffer of VertexManager");
+    D3D::SetDebugObjectName(m_buffers[i], "Buffer of VertexManager");
   }
 
   m_currentBuffer = 0;
@@ -61,8 +66,8 @@ VertexManager::VertexManager()
 {
   LocalVBuffer.resize(MAXVBUFFERSIZE);
 
-  s_pCurBufferPointer = s_pBaseBufferPointer = &LocalVBuffer[0];
-  s_pEndBufferPointer = s_pBaseBufferPointer + LocalVBuffer.size();
+  m_cur_buffer_pointer = m_base_buffer_pointer = &LocalVBuffer[0];
+  m_end_buffer_pointer = m_base_buffer_pointer + LocalVBuffer.size();
 
   LocalIBuffer.resize(MAXIBUFFERSIZE);
 
@@ -78,7 +83,7 @@ void VertexManager::PrepareDrawBuffers(u32 stride)
 {
   D3D11_MAPPED_SUBRESOURCE map;
 
-  u32 vertexBufferSize = u32(s_pCurBufferPointer - s_pBaseBufferPointer);
+  u32 vertexBufferSize = u32(m_cur_buffer_pointer - m_base_buffer_pointer);
   u32 indexBufferSize = IndexGenerator::GetIndexLen() * sizeof(u16);
   u32 totalBufferSize = vertexBufferSize + indexBufferSize;
 
@@ -103,7 +108,7 @@ void VertexManager::PrepareDrawBuffers(u32 stride)
 
   D3D::context->Map(m_buffers[m_currentBuffer], 0, MapType, 0, &map);
   u8* mappedData = reinterpret_cast<u8*>(map.pData);
-  memcpy(mappedData + m_vertexDrawOffset, s_pBaseBufferPointer, vertexBufferSize);
+  memcpy(mappedData + m_vertexDrawOffset, m_base_buffer_pointer, vertexBufferSize);
   memcpy(mappedData + m_indexDrawOffset, GetIndexBuffer(), indexBufferSize);
   D3D::context->Unmap(m_buffers[m_currentBuffer], 0);
 
@@ -123,50 +128,22 @@ void VertexManager::Draw(u32 stride)
   u32 baseVertex = m_vertexDrawOffset / stride;
   u32 startIndex = m_indexDrawOffset / sizeof(u16);
 
-  switch (current_primitive_type)
-  {
-  case PRIMITIVE_POINTS:
-    D3D::stateman->SetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
-    static_cast<Renderer*>(g_renderer.get())->ApplyCullDisable();
-    break;
-  case PRIMITIVE_LINES:
-    D3D::stateman->SetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-    static_cast<Renderer*>(g_renderer.get())->ApplyCullDisable();
-    break;
-  case PRIMITIVE_TRIANGLES:
-    D3D::stateman->SetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    break;
-  }
-
   D3D::stateman->Apply();
   D3D::context->DrawIndexed(indices, startIndex, baseVertex);
 
   INCSTAT(stats.thisFrame.numDrawCalls);
-
-  if (current_primitive_type != PRIMITIVE_TRIANGLES)
-    static_cast<Renderer*>(g_renderer.get())->RestoreCull();
 }
 
-void VertexManager::vFlush(bool useDstAlpha)
+void VertexManager::vFlush()
 {
-  if (!PixelShaderCache::SetShader(useDstAlpha ? DSTALPHA_DUAL_SOURCE_BLEND : DSTALPHA_NONE))
-  {
-    GFX_DEBUGGER_PAUSE_LOG_AT(NEXT_ERROR, true, { printf("Fail to set pixel shader\n"); });
-    return;
-  }
+  u32 stride = VertexLoaderManager::GetCurrentVertexFormat()->GetVertexStride();
+  PrepareDrawBuffers(stride);
 
-  if (!VertexShaderCache::SetShader())
-  {
-    GFX_DEBUGGER_PAUSE_LOG_AT(NEXT_ERROR, true, { printf("Fail to set pixel shader\n"); });
+  if (!m_current_pipeline_object)
     return;
-  }
 
-  if (!GeometryShaderCache::SetShader(current_primitive_type))
-  {
-    GFX_DEBUGGER_PAUSE_LOG_AT(NEXT_ERROR, true, { printf("Fail to set pixel shader\n"); });
-    return;
-  }
-
+  FramebufferManager::SetIntegerEFBRenderTarget(
+      m_current_pipeline_config.blending_state.logicopenable);
   if (g_ActiveConfig.backend_info.bSupportsBBox && BoundingBox::active)
   {
     D3D::context->OMSetRenderTargetsAndUnorderedAccessViews(
@@ -174,21 +151,20 @@ void VertexManager::vFlush(bool useDstAlpha)
         nullptr);
   }
 
-  u32 stride = VertexLoaderManager::GetCurrentVertexFormat()->GetVertexStride();
+  g_renderer->SetPipeline(m_current_pipeline_object);
 
-  PrepareDrawBuffers(stride);
-
-  VertexLoaderManager::GetCurrentVertexFormat()->SetupVertexPointers();
-  g_renderer->ApplyState(useDstAlpha);
+  ID3D11Buffer* vertexConstants = VertexShaderCache::GetConstantBuffer();
+  D3D::stateman->SetPixelConstants(PixelShaderCache::GetConstantBuffer(),
+                                   g_ActiveConfig.bEnablePixelLighting ? vertexConstants : nullptr);
+  D3D::stateman->SetVertexConstants(vertexConstants);
+  D3D::stateman->SetGeometryConstants(GeometryShaderCache::GetConstantBuffer());
 
   Draw(stride);
-
-  g_renderer->RestoreState();
 }
 
 void VertexManager::ResetBuffer(u32 stride)
 {
-  s_pCurBufferPointer = s_pBaseBufferPointer;
+  m_cur_buffer_pointer = m_base_buffer_pointer;
   IndexGenerator::Start(GetIndexBuffer());
 }
 

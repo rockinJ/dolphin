@@ -3,20 +3,27 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include "Core/DSP/DSPHWInterface.h"
+
+#include <atomic>
+#include <cstddef>
+#include <cstring>
+
 #include "Common/CPUDetect.h"
-#include "Common/CommonFuncs.h"
+#include "Common/CommonTypes.h"
+#include "Common/Hash.h"
 #include "Common/Intrinsics.h"
+#include "Common/Logging/Log.h"
 #include "Common/MemoryUtil.h"
-#include "Common/Thread.h"
+#include "Common/Swap.h"
 
 #include "Core/DSP/DSPAccelerator.h"
-#include "Core/DSP/DSPAnalyzer.h"
 #include "Core/DSP/DSPCore.h"
-#include "Core/DSP/DSPHWInterface.h"
 #include "Core/DSP/DSPHost.h"
-#include "Core/DSP/DSPInterpreter.h"
 #include "Core/DSP/DSPTables.h"
 
+namespace DSP
+{
 static void gdsp_do_dma();
 
 void gdsp_ifx_init()
@@ -49,11 +56,11 @@ void gdsp_mbox_write_l(Mailbox mbx, u16 val)
 
 #if defined(_DEBUG) || defined(DEBUGFAST)
   if (mbx == MAILBOX_DSP)
-    INFO_LOG(DSP_MAIL, "DSP(WM) B:%i M:0x%08x (pc=0x%04x)", mbx, gdsp_mbox_peek(MAILBOX_DSP),
-             g_dsp.pc);
+    DEBUG_LOG(DSP_MAIL, "DSP(WM) B:%i M:0x%08x (pc=0x%04x)", mbx, gdsp_mbox_peek(MAILBOX_DSP),
+              g_dsp.pc);
   else
-    INFO_LOG(DSP_MAIL, "CPU(WM) B:%i M:0x%08x (pc=0x%04x)", mbx, gdsp_mbox_peek(MAILBOX_CPU),
-             g_dsp.pc);
+    DEBUG_LOG(DSP_MAIL, "CPU(WM) B:%i M:0x%08x (pc=0x%04x)", mbx, gdsp_mbox_peek(MAILBOX_CPU),
+              g_dsp.pc);
 #endif
 }
 
@@ -81,17 +88,17 @@ u16 gdsp_mbox_read_l(Mailbox mbx)
 
 #if defined(_DEBUG) || defined(DEBUGFAST)
   if (mbx == MAILBOX_DSP)
-    INFO_LOG(DSP_MAIL, "DSP(RM) B:%i M:0x%08x (pc=0x%04x)", mbx, gdsp_mbox_peek(MAILBOX_DSP),
-             g_dsp.pc);
+    DEBUG_LOG(DSP_MAIL, "DSP(RM) B:%i M:0x%08x (pc=0x%04x)", mbx, gdsp_mbox_peek(MAILBOX_DSP),
+              g_dsp.pc);
   else
-    INFO_LOG(DSP_MAIL, "CPU(RM) B:%i M:0x%08x (pc=0x%04x)", mbx, gdsp_mbox_peek(MAILBOX_CPU),
-             g_dsp.pc);
+    DEBUG_LOG(DSP_MAIL, "CPU(RM) B:%i M:0x%08x (pc=0x%04x)", mbx, gdsp_mbox_peek(MAILBOX_CPU),
+              g_dsp.pc);
 #endif
 
   return (u16)value;
 }
 
-void gdsp_ifx_write(u32 addr, u32 val)
+void gdsp_ifx_write(u32 addr, u16 val)
 {
   g_dsp_cap->LogIFXWrite(addr, val);
 
@@ -99,9 +106,9 @@ void gdsp_ifx_write(u32 addr, u32 val)
   {
   case DSP_DIRQ:
     if (val & 0x1)
-      DSPHost::InterruptRequest();
+      Host::InterruptRequest();
     else
-      INFO_LOG(DSPLLE, "Unknown Interrupt Request pc=%04x (%04x)", g_dsp.pc, val);
+      WARN_LOG(DSPLLE, "Unknown Interrupt Request pc=%04x (%04x)", g_dsp.pc, val);
     break;
 
   case DSP_DMBH:
@@ -129,14 +136,10 @@ void gdsp_ifx_write(u32 addr, u32 val)
     g_dsp.ifx_regs[DSP_DSBL] = 0;
     break;
 
-  case DSP_ACDATA1:  // Accelerator write (Zelda type) - "UnkZelda"
-    dsp_write_aram_d3(val);
-    break;
-
   case DSP_GAIN:
     if (val)
     {
-      INFO_LOG(DSPLLE, "Gain Written: 0x%04x", val);
+      DEBUG_LOG(DSPLLE, "Gain Written: 0x%04x", val);
     }
   case DSP_DSPA:
   case DSP_DSMAH:
@@ -144,17 +147,53 @@ void gdsp_ifx_write(u32 addr, u32 val)
   case DSP_DSCR:
     g_dsp.ifx_regs[addr & 0xFF] = val;
     break;
-  /*
-      case DSP_ACCAL:
-        dsp_step_accelerator();
-        break;
-  */
+
+  case DSP_ACSAH:
+    g_dsp.accelerator->SetStartAddress(val << 16 |
+                                       static_cast<u16>(g_dsp.accelerator->GetStartAddress()));
+    break;
+  case DSP_ACSAL:
+    g_dsp.accelerator->SetStartAddress(
+        static_cast<u16>(g_dsp.accelerator->GetStartAddress() >> 16) << 16 | val);
+    break;
+  case DSP_ACEAH:
+    g_dsp.accelerator->SetEndAddress(val << 16 |
+                                     static_cast<u16>(g_dsp.accelerator->GetEndAddress()));
+    break;
+  case DSP_ACEAL:
+    g_dsp.accelerator->SetEndAddress(
+        static_cast<u16>(g_dsp.accelerator->GetEndAddress() >> 16) << 16 | val);
+    break;
+  case DSP_ACCAH:
+    g_dsp.accelerator->SetCurrentAddress(val << 16 |
+                                         static_cast<u16>(g_dsp.accelerator->GetCurrentAddress()));
+    break;
+  case DSP_ACCAL:
+    g_dsp.accelerator->SetCurrentAddress(
+        static_cast<u16>(g_dsp.accelerator->GetCurrentAddress() >> 16) << 16 | val);
+    break;
+  case DSP_FORMAT:
+    g_dsp.accelerator->SetSampleFormat(val);
+    break;
+  case DSP_YN1:
+    g_dsp.accelerator->SetYn1(val);
+    break;
+  case DSP_YN2:
+    g_dsp.accelerator->SetYn2(val);
+    break;
+  case DSP_PRED_SCALE:
+    g_dsp.accelerator->SetPredScale(val);
+    break;
+  case DSP_ACDATA1:  // Accelerator write (Zelda type) - "UnkZelda"
+    g_dsp.accelerator->WriteD3(val);
+    break;
+
   default:
     if ((addr & 0xff) >= 0xa0)
     {
       if (pdlabels[(addr & 0xFF) - 0xa0].name && pdlabels[(addr & 0xFF) - 0xa0].description)
       {
-        INFO_LOG(DSPLLE, "%04x MW %s (%04x)", g_dsp.pc, pdlabels[(addr & 0xFF) - 0xa0].name, val);
+        DEBUG_LOG(DSPLLE, "%04x MW %s (%04x)", g_dsp.pc, pdlabels[(addr & 0xFF) - 0xa0].name, val);
       }
       else
       {
@@ -189,19 +228,38 @@ static u16 _gdsp_ifx_read(u16 addr)
   case DSP_DSCR:
     return g_dsp.ifx_regs[addr & 0xFF];
 
+  case DSP_ACSAH:
+    return static_cast<u16>(g_dsp.accelerator->GetStartAddress() >> 16);
+  case DSP_ACSAL:
+    return static_cast<u16>(g_dsp.accelerator->GetStartAddress());
+  case DSP_ACEAH:
+    return static_cast<u16>(g_dsp.accelerator->GetEndAddress() >> 16);
+  case DSP_ACEAL:
+    return static_cast<u16>(g_dsp.accelerator->GetEndAddress());
+  case DSP_ACCAH:
+    return static_cast<u16>(g_dsp.accelerator->GetCurrentAddress() >> 16);
+  case DSP_ACCAL:
+    return static_cast<u16>(g_dsp.accelerator->GetCurrentAddress());
+  case DSP_FORMAT:
+    return g_dsp.accelerator->GetSampleFormat();
+  case DSP_YN1:
+    return g_dsp.accelerator->GetYn1();
+  case DSP_YN2:
+    return g_dsp.accelerator->GetYn2();
+  case DSP_PRED_SCALE:
+    return g_dsp.accelerator->GetPredScale();
   case DSP_ACCELERATOR:  // ADPCM Accelerator reads
-    return dsp_read_accelerator();
-
+    return g_dsp.accelerator->Read(reinterpret_cast<s16*>(&g_dsp.ifx_regs[DSP_COEF_A1_0]));
   case DSP_ACDATA1:  // Accelerator reads (Zelda type) - "UnkZelda"
-    return dsp_read_aram_d3();
+    return g_dsp.accelerator->ReadD3();
 
   default:
     if ((addr & 0xff) >= 0xa0)
     {
       if (pdlabels[(addr & 0xFF) - 0xa0].name && pdlabels[(addr & 0xFF) - 0xa0].description)
       {
-        INFO_LOG(DSPLLE, "%04x MR %s (%04x)", g_dsp.pc, pdlabels[(addr & 0xFF) - 0xa0].name,
-                 g_dsp.ifx_regs[addr & 0xFF]);
+        DEBUG_LOG(DSPLLE, "%04x MR %s (%04x)", g_dsp.pc, pdlabels[(addr & 0xFF) - 0xa0].name,
+                  g_dsp.ifx_regs[addr & 0xFF]);
       }
       else
       {
@@ -225,22 +283,22 @@ u16 gdsp_ifx_read(u16 addr)
 
 static const u8* gdsp_idma_in(u16 dsp_addr, u32 addr, u32 size)
 {
-  UnWriteProtectMemory(g_dsp.iram, DSP_IRAM_BYTE_SIZE, false);
+  u16* dst = g_dsp.iram + (dsp_addr / 2);
 
-  u8* dst = ((u8*)g_dsp.iram);
-  for (u32 i = 0; i < size; i += 2)
-  {
-    *(u16*)&dst[dsp_addr + i] =
-        Common::swap16(*(const u16*)&g_dsp.cpu_ram[(addr + i) & 0x0fffffff]);
-  }
-  WriteProtectMemory(g_dsp.iram, DSP_IRAM_BYTE_SIZE, false);
+  const u8* code = &g_dsp.cpu_ram[addr & 0x0fffffff];
+  g_dsp.iram_crc = Common::HashEctor(code, size);
 
-  DSPHost::CodeLoaded((const u8*)g_dsp.iram + dsp_addr, size);
+  Common::UnWriteProtectMemory(g_dsp.iram, DSP_IRAM_BYTE_SIZE, false);
+  memcpy(dst, code, size);
+  for (size_t i = 0; i < size / 2; i++)
+    dst[i] = Common::swap16(dst[i]);
+  Common::WriteProtectMemory(g_dsp.iram, DSP_IRAM_BYTE_SIZE, false);
 
+  Host::CodeLoaded(code, size);
   NOTICE_LOG(DSPLLE, "*** Copy new UCode from 0x%08x to 0x%04x (crc: %8x)", addr, dsp_addr,
              g_dsp.iram_crc);
 
-  return dst + dsp_addr;
+  return reinterpret_cast<u8*>(dst);
 }
 
 static const u8* gdsp_idma_out(u16 dsp_addr, u32 addr, u32 size)
@@ -251,25 +309,41 @@ static const u8* gdsp_idma_out(u16 dsp_addr, u32 addr, u32 size)
   return nullptr;
 }
 
-#if _M_SSE >= 0x301
+#if defined(_M_X86) || defined(_M_X86_64)
 static const __m128i s_mask = _mm_set_epi32(0x0E0F0C0DL, 0x0A0B0809L, 0x06070405L, 0x02030001L);
+
+FUNCTION_TARGET_SSSE3
+static void gdsp_ddma_in_SSSE3(u16 dsp_addr, u32 addr, u32 size, u8* dst)
+{
+  for (u32 i = 0; i < size; i += 16)
+  {
+    _mm_storeu_si128(
+        (__m128i*)&dst[dsp_addr + i],
+        _mm_shuffle_epi8(_mm_loadu_si128((__m128i*)&g_dsp.cpu_ram[(addr + i) & 0x7FFFFFFF]),
+                         s_mask));
+  }
+}
+
+FUNCTION_TARGET_SSSE3
+static void gdsp_ddma_out_SSSE3(u16 dsp_addr, u32 addr, u32 size, const u8* src)
+{
+  for (u32 i = 0; i < size; i += 16)
+  {
+    _mm_storeu_si128((__m128i*)&g_dsp.cpu_ram[(addr + i) & 0x7FFFFFFF],
+                     _mm_shuffle_epi8(_mm_loadu_si128((__m128i*)&src[dsp_addr + i]), s_mask));
+  }
+}
 #endif
 
 // TODO: These should eat clock cycles.
 static const u8* gdsp_ddma_in(u16 dsp_addr, u32 addr, u32 size)
 {
-  u8* dst = ((u8*)g_dsp.dram);
+  u8* dst = reinterpret_cast<u8*>(g_dsp.dram);
 
-#if _M_SSE >= 0x301
+#if defined(_M_X86) || defined(_M_X86_64)
   if (cpu_info.bSSSE3 && !(size % 16))
   {
-    for (u32 i = 0; i < size; i += 16)
-    {
-      _mm_storeu_si128(
-          (__m128i*)&dst[dsp_addr + i],
-          _mm_shuffle_epi8(_mm_loadu_si128((__m128i*)&g_dsp.cpu_ram[(addr + i) & 0x7FFFFFFF]),
-                           s_mask));
-    }
+    gdsp_ddma_in_SSSE3(dsp_addr, addr, size, dst);
   }
   else
 #endif
@@ -280,24 +354,20 @@ static const u8* gdsp_ddma_in(u16 dsp_addr, u32 addr, u32 size)
           Common::swap16(*(const u16*)&g_dsp.cpu_ram[(addr + i) & 0x7FFFFFFF]);
     }
   }
-  INFO_LOG(DSPLLE, "*** ddma_in RAM (0x%08x) -> DRAM_DSP (0x%04x) : size (0x%08x)", addr,
-           dsp_addr / 2, size);
+  DEBUG_LOG(DSPLLE, "*** ddma_in RAM (0x%08x) -> DRAM_DSP (0x%04x) : size (0x%08x)", addr,
+            dsp_addr / 2, size);
 
   return dst + dsp_addr;
 }
 
 static const u8* gdsp_ddma_out(u16 dsp_addr, u32 addr, u32 size)
 {
-  const u8* src = ((const u8*)g_dsp.dram);
+  const u8* src = reinterpret_cast<const u8*>(g_dsp.dram);
 
-#if _M_SSE >= 0x301
+#ifdef _M_X86
   if (cpu_info.bSSSE3 && !(size % 16))
   {
-    for (u32 i = 0; i < size; i += 16)
-    {
-      _mm_storeu_si128((__m128i*)&g_dsp.cpu_ram[(addr + i) & 0x7FFFFFFF],
-                       _mm_shuffle_epi8(_mm_loadu_si128((__m128i*)&src[dsp_addr + i]), s_mask));
-    }
+    gdsp_ddma_out_SSSE3(dsp_addr, addr, size, src);
   }
   else
 #endif
@@ -309,8 +379,8 @@ static const u8* gdsp_ddma_out(u16 dsp_addr, u32 addr, u32 size)
     }
   }
 
-  INFO_LOG(DSPLLE, "*** ddma_out DRAM_DSP (0x%04x) -> RAM (0x%08x) : size (0x%08x)", dsp_addr / 2,
-           addr, size);
+  DEBUG_LOG(DSPLLE, "*** ddma_out DRAM_DSP (0x%04x) -> RAM (0x%08x) : size (0x%08x)", dsp_addr / 2,
+            addr, size);
 
   return src + dsp_addr;
 }
@@ -357,3 +427,4 @@ static void gdsp_do_dma()
   if (copied_data_ptr)
     g_dsp_cap->LogDMA(ctl, addr, dsp_addr, len, copied_data_ptr);
 }
+}  // namespace DSP

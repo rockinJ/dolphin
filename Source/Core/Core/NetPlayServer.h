@@ -6,19 +6,24 @@
 
 #include <SFML/Network/Packet.hpp>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
-#include "Common/FifoQueue.h"
+#include <utility>
+#include "Common/Event.h"
+#include "Common/QoSSession.h"
+#include "Common/SPSCQueue.h"
 #include "Common/Timer.h"
 #include "Common/TraversalClient.h"
 #include "Core/NetPlayProto.h"
+#include "InputCommon/GCPadStatus.h"
 
-enum class PlayerGameStatus;
-
+namespace NetPlay
+{
 class NetPlayUI;
 enum class PlayerGameStatus;
 
@@ -26,9 +31,14 @@ class NetPlayServer : public TraversalClientClient
 {
 public:
   void ThreadFunc();
-  void SendAsyncToClients(std::unique_ptr<sf::Packet> packet);
+  void SendAsync(sf::Packet&& packet, PlayerId pid, u8 channel_id = DEFAULT_CHANNEL);
+  void SendAsyncToClients(sf::Packet&& packet, PlayerId skip_pid = 0,
+                          u8 channel_id = DEFAULT_CHANNEL);
+  void SendChunked(sf::Packet&& packet, PlayerId pid, const std::string& title = "");
+  void SendChunkedToClients(sf::Packet&& packet, PlayerId skip_pid = 0,
+                            const std::string& title = "");
 
-  NetPlayServer(const u16 port, bool traversal, const std::string& centralServer, u16 centralPort);
+  NetPlayServer(u16 port, bool forward_port, const NetTraversalConfig& traversal_config);
   ~NetPlayServer();
 
   bool ChangeGame(const std::string& game);
@@ -38,7 +48,9 @@ public:
 
   void SetNetSettings(const NetSettings& settings);
 
+  bool DoAllPlayersHaveIPLDump() const;
   bool StartGame();
+  bool RequestStartGame();
 
   PadMappingArray GetPadMapping() const;
   void SetPadMapping(const PadMappingArray& mappings);
@@ -47,20 +59,17 @@ public:
   void SetWiimoteMapping(const PadMappingArray& mappings);
 
   void AdjustPadBufferSize(unsigned int size);
+  void SetHostInputAuthority(bool enable);
 
   void KickPlayer(PlayerId player);
 
-  u16 GetPort();
+  u16 GetPort() const;
 
   void SetNetPlayUI(NetPlayUI* dialog);
-  std::unordered_set<std::string> GetInterfaceSet();
-  std::string GetInterfaceHost(const std::string& inter);
+  std::unordered_set<std::string> GetInterfaceSet() const;
+  std::string GetInterfaceHost(const std::string& inter) const;
 
   bool is_connected = false;
-
-#ifdef USE_UPNP
-  void TryPortmapping(u16 port);
-#endif
 
 private:
   class Client
@@ -70,18 +79,54 @@ private:
     std::string name;
     std::string revision;
     PlayerGameStatus game_status;
+    bool has_ipl_dump;
 
     ENetPeer* socket;
     u32 ping;
     u32 current_game;
 
+    Common::QoSSession qos_session;
+
     bool operator==(const Client& other) const { return this == &other; }
+    bool IsHost() const { return pid == 1; }
   };
 
-  void SendToClients(sf::Packet& packet, const PlayerId skip_pid = 0);
-  void Send(ENetPeer* socket, sf::Packet& packet);
+  enum class TargetMode
+  {
+    Only,
+    AllExcept
+  };
+
+  struct AsyncQueueEntry
+  {
+    sf::Packet packet;
+    PlayerId target_pid;
+    TargetMode target_mode;
+    u8 channel_id;
+  };
+
+  struct ChunkedDataQueueEntry
+  {
+    sf::Packet packet;
+    PlayerId target_pid;
+    TargetMode target_mode;
+    std::string title;
+  };
+
+  bool SyncSaveData();
+  bool SyncCodes();
+  void CheckSyncAndStartGame();
+  bool CompressFileIntoPacket(const std::string& file_path, sf::Packet& packet);
+  bool CompressBufferIntoPacket(const std::vector<u8>& in_buffer, sf::Packet& packet);
+  void SendFirstReceivedToHost(PadMapping map, bool state);
+
+  u64 GetInitialNetPlayRTC() const;
+
+  void SendToClients(const sf::Packet& packet, PlayerId skip_pid = 0,
+                     u8 channel_id = DEFAULT_CHANNEL);
+  void Send(ENetPeer* socket, const sf::Packet& packet, u8 channel_id = DEFAULT_CHANNEL);
   unsigned int OnConnect(ENetPeer* socket);
-  unsigned int OnDisconnect(Client& player);
+  unsigned int OnDisconnect(const Client& player);
   unsigned int OnData(sf::Packet& packet, Client& player);
 
   void OnTraversalStateChanged() override;
@@ -89,7 +134,9 @@ private:
   void OnConnectFailed(u8) override {}
   void UpdatePadMapping();
   void UpdateWiimoteMapping();
-  std::vector<std::pair<std::string, std::string>> GetInterfaceListInternal();
+  std::vector<std::pair<std::string, std::string>> GetInterfaceListInternal() const;
+  void ChunkedDataThreadFunc();
+  void ChunkedDataSend(sf::Packet&& packet, PlayerId pid, const TargetMode target_mode);
 
   NetSettings m_settings;
 
@@ -102,11 +149,20 @@ private:
   unsigned int m_target_buffer_size = 0;
   PadMappingArray m_pad_map;
   PadMappingArray m_wiimote_map;
+  unsigned int m_save_data_synced_players = 0;
+  unsigned int m_codes_synced_players = 0;
+  bool m_saves_synced = true;
+  bool m_codes_synced = true;
+  bool m_start_pending = false;
+  bool m_host_input_authority = false;
 
   std::map<PlayerId, Client> m_players;
 
   std::unordered_map<u32, std::vector<std::pair<PlayerId, u64>>> m_timebase_by_frame;
   bool m_desync_detected;
+
+  std::array<GCPadStatus, 4> m_last_pad_status{};
+  std::array<bool, 4> m_first_pad_status_received{};
 
   struct
   {
@@ -114,30 +170,22 @@ private:
     // lock order
     std::recursive_mutex players;
     std::recursive_mutex async_queue_write;
+    std::recursive_mutex chunked_data_queue_write;
   } m_crit;
+
+  Common::SPSCQueue<AsyncQueueEntry, false> m_async_queue;
+  Common::SPSCQueue<ChunkedDataQueueEntry, false> m_chunked_data_queue;
 
   std::string m_selected_game;
   std::thread m_thread;
-  Common::FifoQueue<std::unique_ptr<sf::Packet>, false> m_async_queue;
+  Common::Event m_chunked_data_event;
+  Common::Event m_chunked_data_complete_event;
+  std::thread m_chunked_data_thread;
+  u32 m_next_chunked_data_id;
+  std::unordered_map<u32, unsigned int> m_chunked_data_complete_count;
 
   ENetHost* m_server = nullptr;
   TraversalClient* m_traversal_client = nullptr;
   NetPlayUI* m_dialog = nullptr;
-
-#ifdef USE_UPNP
-  static void mapPortThread(const u16 port);
-  static void unmapPortThread();
-
-  static bool initUPnP();
-  static bool UPnPMapPort(const std::string& addr, const u16 port);
-  static bool UPnPUnmapPort(const u16 port);
-
-  static struct UPNPUrls m_upnp_urls;
-  static struct IGDdatas m_upnp_data;
-  static std::string m_upnp_ourip;
-  static u16 m_upnp_mapped;
-  static bool m_upnp_inited;
-  static bool m_upnp_error;
-  static std::thread m_upnp_thread;
-#endif
 };
+}  // namespace NetPlay

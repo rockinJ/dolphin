@@ -4,6 +4,9 @@
 
 #pragma once
 
+#include <array>
+#include <cstddef>
+
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 
@@ -58,63 +61,60 @@ enum
   FL_INOUT_FLOAT_D = FL_IN_FLOAT_D | FL_OUT_FLOAT_D,
 };
 
-enum
+enum class OpType
 {
-  OPTYPE_INVALID,
-  OPTYPE_SUBTABLE,
-  OPTYPE_INTEGER,
-  OPTYPE_CR,
-  OPTYPE_SPR,
-  OPTYPE_SYSTEM,
-  OPTYPE_SYSTEMFP,
-  OPTYPE_LOAD,
-  OPTYPE_STORE,
-  OPTYPE_LOADFP,
-  OPTYPE_STOREFP,
-  OPTYPE_DOUBLEFP,
-  OPTYPE_SINGLEFP,
-  OPTYPE_LOADPS,
-  OPTYPE_STOREPS,
-  OPTYPE_PS,
-  OPTYPE_DCACHE,
-  OPTYPE_ICACHE,
-  OPTYPE_BRANCH,
-  OPTYPE_UNKNOWN,
+  Invalid,
+  Subtable,
+  Integer,
+  CR,
+  SPR,
+  System,
+  SystemFP,
+  Load,
+  Store,
+  LoadFP,
+  StoreFP,
+  DoubleFP,
+  SingleFP,
+  LoadPS,
+  StorePS,
+  PS,
+  DataCache,
+  InstructionCache,
+  Branch,
+  Unknown,
 };
 
 struct GekkoOPInfo
 {
   const char* opname;
-  int type;
+  OpType type;
   int flags;
   int numCycles;
   u64 runCount;
   int compileCount;
   u32 lastUse;
 };
-extern GekkoOPInfo* m_infoTable[64];
-extern GekkoOPInfo* m_infoTable4[1024];
-extern GekkoOPInfo* m_infoTable19[1024];
-extern GekkoOPInfo* m_infoTable31[1024];
-extern GekkoOPInfo* m_infoTable59[32];
-extern GekkoOPInfo* m_infoTable63[1024];
+extern std::array<GekkoOPInfo*, 64> m_infoTable;
+extern std::array<GekkoOPInfo*, 1024> m_infoTable4;
+extern std::array<GekkoOPInfo*, 1024> m_infoTable19;
+extern std::array<GekkoOPInfo*, 1024> m_infoTable31;
+extern std::array<GekkoOPInfo*, 32> m_infoTable59;
+extern std::array<GekkoOPInfo*, 1024> m_infoTable63;
 
-extern GekkoOPInfo* m_allInstructions[512];
-
-extern int m_numInstructions;
-
-GekkoOPInfo* GetOpInfo(UGeckoInstruction _inst);
-Interpreter::Instruction GetInterpreterOp(UGeckoInstruction _inst);
+extern std::array<GekkoOPInfo*, 512> m_allInstructions;
+extern size_t m_numInstructions;
 
 namespace PPCTables
 {
-void InitTables(int cpu_core);
-bool IsValidInstruction(UGeckoInstruction _instCode);
-bool UsesFPU(UGeckoInstruction _inst);
+GekkoOPInfo* GetOpInfo(UGeckoInstruction inst);
+Interpreter::Instruction GetInterpreterOp(UGeckoInstruction inst);
 
-void CountInstruction(UGeckoInstruction _inst);
+bool IsValidInstruction(UGeckoInstruction inst);
+bool UsesFPU(UGeckoInstruction inst);
+
+void CountInstruction(UGeckoInstruction inst);
 void PrintInstructionRunCounts();
 void LogCompiledInstructions();
-const char* GetInstructionName(UGeckoInstruction _inst);
-
-}  // namespace
+const char* GetInstructionName(UGeckoInstruction inst);
+}  // namespace PPCTables

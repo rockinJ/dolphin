@@ -7,10 +7,13 @@
 #include <utility>
 
 #include "Common/Assert.h"
+#include "Common/BitUtils.h"
 #include "Common/CommonTypes.h"
 #include "Common/MathUtil.h"
+#include "Core/PowerPC/Interpreter/ExceptionUtils.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/Interpreter/Interpreter_FPUtils.h"
+#include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 
 // dequantize table
@@ -153,7 +156,8 @@ void WritePair<u32>(u32 val1, u32 val2, u32 addr)
 template <typename T>
 void QuantizeAndStore(double ps0, double ps1, u32 addr, u32 instW, u32 stScale)
 {
-  typedef typename std::make_unsigned<T>::type U;
+  using U = std::make_unsigned_t<T>;
+
   U convPS0 = (U)ScaleAndClamp<T>(ps0, stScale);
   if (instW)
   {
@@ -172,21 +176,26 @@ void Interpreter::Helper_Quantize(u32 addr, u32 instI, u32 instRS, u32 instW)
   const EQuantizeType stType = gqr.st_type;
   const unsigned int stScale = gqr.st_scale;
 
-  double ps0 = rPS0(instRS);
-  double ps1 = rPS1(instRS);
+  const double ps0 = rPS0(instRS);
+  const double ps1 = rPS1(instRS);
+
   switch (stType)
   {
   case QUANTIZE_FLOAT:
   {
-    u32 convPS0 = ConvertToSingleFTZ(MathUtil::IntDouble(ps0).i);
+    const u64 integral_ps0 = Common::BitCast<u64>(ps0);
+    const u32 conv_ps0 = ConvertToSingleFTZ(integral_ps0);
+
     if (instW)
     {
-      WriteUnpaired<u32>(convPS0, addr);
+      WriteUnpaired<u32>(conv_ps0, addr);
     }
     else
     {
-      u32 convPS1 = ConvertToSingleFTZ(MathUtil::IntDouble(ps1).i);
-      WritePair<u32>(convPS0, convPS1, addr);
+      const u64 integral_ps1 = Common::BitCast<u64>(ps1);
+      const u32 conv_ps1 = ConvertToSingleFTZ(integral_ps1);
+
+      WritePair<u32>(conv_ps0, conv_ps1, addr);
     }
     break;
   }
@@ -210,7 +219,7 @@ void Interpreter::Helper_Quantize(u32 addr, u32 instI, u32 instRS, u32 instW)
   case QUANTIZE_INVALID1:
   case QUANTIZE_INVALID2:
   case QUANTIZE_INVALID3:
-    _assert_msg_(POWERPC, 0, "PS dequantize - unknown type to read");
+    ASSERT_MSG(POWERPC, 0, "PS dequantize - unknown type to read");
     break;
   }
 }
@@ -218,7 +227,8 @@ void Interpreter::Helper_Quantize(u32 addr, u32 instI, u32 instRS, u32 instW)
 template <typename T>
 std::pair<float, float> LoadAndDequantize(u32 addr, u32 instW, u32 ldScale)
 {
-  typedef typename std::make_unsigned<T>::type U;
+  using U = std::make_unsigned_t<T>;
+
   float ps0, ps1;
   if (instW)
   {
@@ -249,15 +259,15 @@ void Interpreter::Helper_Dequantize(u32 addr, u32 instI, u32 instRD, u32 instW)
   case QUANTIZE_FLOAT:
     if (instW)
     {
-      u32 value = ReadUnpaired<u32>(addr);
-      ps0 = MathUtil::IntFloat(value).f;
+      const u32 value = ReadUnpaired<u32>(addr);
+      ps0 = Common::BitCast<float>(value);
       ps1 = 1.0f;
     }
     else
     {
-      std::pair<u32, u32> value = ReadPair<u32>(addr);
-      ps0 = MathUtil::IntFloat(value.first).f;
-      ps1 = MathUtil::IntFloat(value.second).f;
+      const std::pair<u32, u32> value = ReadPair<u32>(addr);
+      ps0 = Common::BitCast<float>(value.first);
+      ps1 = Common::BitCast<float>(value.second);
     }
     break;
 
@@ -280,7 +290,7 @@ void Interpreter::Helper_Dequantize(u32 addr, u32 instI, u32 instRD, u32 instW)
   case QUANTIZE_INVALID1:
   case QUANTIZE_INVALID2:
   case QUANTIZE_INVALID3:
-    _assert_msg_(POWERPC, 0, "PS dequantize - unknown type to read");
+    ASSERT_MSG(POWERPC, 0, "PS dequantize - unknown type to read");
     ps0 = 0.f;
     ps1 = 0.f;
     break;
@@ -295,74 +305,98 @@ void Interpreter::Helper_Dequantize(u32 addr, u32 instI, u32 instRD, u32 instW)
   rPS1(instRD) = ps1;
 }
 
-void Interpreter::psq_l(UGeckoInstruction _inst)
+void Interpreter::psq_l(UGeckoInstruction inst)
 {
-  const u32 EA = _inst.RA ? (rGPR[_inst.RA] + _inst.SIMM_12) : (u32)_inst.SIMM_12;
-  Helper_Dequantize(EA, _inst.I, _inst.RD, _inst.W);
+  if (HID2.LSQE == 0)
+  {
+    GenerateProgramException();
+    return;
+  }
+
+  const u32 EA = inst.RA ? (rGPR[inst.RA] + inst.SIMM_12) : (u32)inst.SIMM_12;
+  Helper_Dequantize(EA, inst.I, inst.RD, inst.W);
 }
 
-void Interpreter::psq_lu(UGeckoInstruction _inst)
+void Interpreter::psq_lu(UGeckoInstruction inst)
 {
-  const u32 EA = rGPR[_inst.RA] + _inst.SIMM_12;
-  Helper_Dequantize(EA, _inst.I, _inst.RD, _inst.W);
+  if (HID2.LSQE == 0)
+  {
+    GenerateProgramException();
+    return;
+  }
+
+  const u32 EA = rGPR[inst.RA] + inst.SIMM_12;
+  Helper_Dequantize(EA, inst.I, inst.RD, inst.W);
 
   if (PowerPC::ppcState.Exceptions & EXCEPTION_DSI)
   {
     return;
   }
-  rGPR[_inst.RA] = EA;
+  rGPR[inst.RA] = EA;
 }
 
-void Interpreter::psq_st(UGeckoInstruction _inst)
+void Interpreter::psq_st(UGeckoInstruction inst)
 {
-  const u32 EA = _inst.RA ? (rGPR[_inst.RA] + _inst.SIMM_12) : (u32)_inst.SIMM_12;
-  Helper_Quantize(EA, _inst.I, _inst.RS, _inst.W);
+  if (HID2.LSQE == 0)
+  {
+    GenerateProgramException();
+    return;
+  }
+
+  const u32 EA = inst.RA ? (rGPR[inst.RA] + inst.SIMM_12) : (u32)inst.SIMM_12;
+  Helper_Quantize(EA, inst.I, inst.RS, inst.W);
 }
 
-void Interpreter::psq_stu(UGeckoInstruction _inst)
+void Interpreter::psq_stu(UGeckoInstruction inst)
 {
-  const u32 EA = rGPR[_inst.RA] + _inst.SIMM_12;
-  Helper_Quantize(EA, _inst.I, _inst.RS, _inst.W);
+  if (HID2.LSQE == 0)
+  {
+    GenerateProgramException();
+    return;
+  }
+
+  const u32 EA = rGPR[inst.RA] + inst.SIMM_12;
+  Helper_Quantize(EA, inst.I, inst.RS, inst.W);
 
   if (PowerPC::ppcState.Exceptions & EXCEPTION_DSI)
   {
     return;
   }
-  rGPR[_inst.RA] = EA;
+  rGPR[inst.RA] = EA;
 }
 
-void Interpreter::psq_lx(UGeckoInstruction _inst)
+void Interpreter::psq_lx(UGeckoInstruction inst)
 {
-  const u32 EA = _inst.RA ? (rGPR[_inst.RA] + rGPR[_inst.RB]) : rGPR[_inst.RB];
-  Helper_Dequantize(EA, _inst.Ix, _inst.RD, _inst.Wx);
+  const u32 EA = inst.RA ? (rGPR[inst.RA] + rGPR[inst.RB]) : rGPR[inst.RB];
+  Helper_Dequantize(EA, inst.Ix, inst.RD, inst.Wx);
 }
 
-void Interpreter::psq_stx(UGeckoInstruction _inst)
+void Interpreter::psq_stx(UGeckoInstruction inst)
 {
-  const u32 EA = _inst.RA ? (rGPR[_inst.RA] + rGPR[_inst.RB]) : rGPR[_inst.RB];
-  Helper_Quantize(EA, _inst.Ix, _inst.RS, _inst.Wx);
+  const u32 EA = inst.RA ? (rGPR[inst.RA] + rGPR[inst.RB]) : rGPR[inst.RB];
+  Helper_Quantize(EA, inst.Ix, inst.RS, inst.Wx);
 }
 
-void Interpreter::psq_lux(UGeckoInstruction _inst)
+void Interpreter::psq_lux(UGeckoInstruction inst)
 {
-  const u32 EA = rGPR[_inst.RA] + rGPR[_inst.RB];
-  Helper_Dequantize(EA, _inst.Ix, _inst.RD, _inst.Wx);
+  const u32 EA = rGPR[inst.RA] + rGPR[inst.RB];
+  Helper_Dequantize(EA, inst.Ix, inst.RD, inst.Wx);
 
   if (PowerPC::ppcState.Exceptions & EXCEPTION_DSI)
   {
     return;
   }
-  rGPR[_inst.RA] = EA;
+  rGPR[inst.RA] = EA;
 }
 
-void Interpreter::psq_stux(UGeckoInstruction _inst)
+void Interpreter::psq_stux(UGeckoInstruction inst)
 {
-  const u32 EA = rGPR[_inst.RA] + rGPR[_inst.RB];
-  Helper_Quantize(EA, _inst.Ix, _inst.RS, _inst.Wx);
+  const u32 EA = rGPR[inst.RA] + rGPR[inst.RB];
+  Helper_Quantize(EA, inst.Ix, inst.RS, inst.Wx);
 
   if (PowerPC::ppcState.Exceptions & EXCEPTION_DSI)
   {
     return;
   }
-  rGPR[_inst.RA] = EA;
+  rGPR[inst.RA] = EA;
 }

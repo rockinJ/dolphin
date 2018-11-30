@@ -14,33 +14,32 @@
 #include "Core/Debugger/PPCDebugInterface.h"
 
 // This has functionality overlapping Debugger_Symbolmap. Should merge that stuff in here later.
-class PPCSymbolDB : public SymbolDB
+class PPCSymbolDB : public Common::SymbolDB
 {
-private:
-  DebugInterface* debugger;
-
 public:
-  typedef void (*functionGetterCallback)(Symbol* f);
-
   PPCSymbolDB();
-  ~PPCSymbolDB();
+  ~PPCSymbolDB() override;
 
-  Symbol* AddFunction(u32 startAddr) override;
+  Common::Symbol* AddFunction(u32 start_addr) override;
   void AddKnownSymbol(u32 startAddr, u32 size, const std::string& name,
-                      int type = Symbol::SYMBOL_FUNCTION);
+                      Common::Symbol::Type type = Common::Symbol::Type::Function);
 
-  Symbol* GetSymbolFromAddr(u32 addr) override;
+  Common::Symbol* GetSymbolFromAddr(u32 addr) override;
 
-  const std::string GetDescription(u32 addr);
+  std::string GetDescription(u32 addr);
 
   void FillInCallers();
 
   bool LoadMap(const std::string& filename, bool bad = false);
-  bool SaveMap(const std::string& filename, bool WithCodes = false) const;
+  bool SaveSymbolMap(const std::string& filename) const;
+  bool SaveCodeMap(const std::string& filename) const;
 
   void PrintCalls(u32 funcAddr) const;
   void PrintCallers(u32 funcAddr) const;
   void LogFunctionCall(u32 addr);
+
+private:
+  Common::DebugInterface* debugger;
 };
 
 extern PPCSymbolDB g_symbolDB;

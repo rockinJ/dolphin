@@ -6,42 +6,43 @@
 // Supports simple memory patches, and has a partial Action Replay implementation
 // in ActionReplay.cpp/h.
 
-// TODO: Still even needed?  Zelda WW now works with improved DSP code.
-// Zelda item hang fixes:
-// [Tue Aug 21 2007] [18:30:40] <Knuckles->    0x802904b4 in US released
-// [Tue Aug 21 2007] [18:30:53] <Knuckles->    0x80294d54 in EUR Demo version
-// [Tue Aug 21 2007] [18:31:10] <Knuckles->    we just patch a blr on it (0x4E800020)
-// [OnLoad]
-// 0x80020394=dword,0x4e800020
+#include "Core/PatchEngine.h"
 
 #include <algorithm>
+#include <array>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
 #include <vector>
 
-#include "Common/CommonPaths.h"
-#include "Common/FileUtil.h"
+#include "Common/Assert.h"
 #include "Common/IniFile.h"
 #include "Common/StringUtil.h"
 
 #include "Core/ActionReplay.h"
+#include "Core/Config/MainSettings.h"
 #include "Core/ConfigManager.h"
 #include "Core/GeckoCode.h"
 #include "Core/GeckoCodeConfig.h"
-#include "Core/PatchEngine.h"
+#include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
-
-using namespace Common;
 
 namespace PatchEngine
 {
-const char* PatchTypeStrings[] = {
-    "byte", "word", "dword",
-};
+constexpr std::array<const char*, 3> s_patch_type_strings{{
+    "byte",
+    "word",
+    "dword",
+}};
 
-static std::vector<Patch> onFrame;
-static std::map<u32, int> speedHacks;
+static std::vector<Patch> s_on_frame;
+static std::map<u32, int> s_speed_hacks;
+
+const char* PatchTypeAsString(PatchType type)
+{
+  return s_patch_type_strings.at(static_cast<int>(type));
+}
 
 void LoadPatchSection(const std::string& section, std::vector<Patch>& patches, IniFile& globalIni,
                       IniFile& localIni)
@@ -96,8 +97,7 @@ void LoadPatchSection(const std::string& section, std::vector<Patch>& patches, I
           line[loc] = ':';
         }
 
-        std::vector<std::string> items;
-        SplitString(line, ':', items);
+        const std::vector<std::string> items = SplitString(line, ':');
 
         if (items.size() >= 3)
         {
@@ -106,8 +106,10 @@ void LoadPatchSection(const std::string& section, std::vector<Patch>& patches, I
           success &= TryParse(items[0], &pE.address);
           success &= TryParse(items[2], &pE.value);
 
-          pE.type = PatchType(std::find(PatchTypeStrings, PatchTypeStrings + 3, items[1]) -
-                              PatchTypeStrings);
+          const auto iter =
+              std::find(s_patch_type_strings.begin(), s_patch_type_strings.end(), items[1]);
+          pE.type = PatchType(std::distance(s_patch_type_strings.begin(), iter));
+
           success &= (pE.type != (PatchType)3);
           if (success)
           {
@@ -141,7 +143,7 @@ static void LoadSpeedhacks(const std::string& section, IniFile& ini)
       success &= TryParse(value, &cycles);
       if (success)
       {
-        speedHacks[address] = (int)cycles;
+        s_speed_hacks[address] = static_cast<int>(cycles);
       }
     }
   }
@@ -149,11 +151,11 @@ static void LoadSpeedhacks(const std::string& section, IniFile& ini)
 
 int GetSpeedhackCycles(const u32 addr)
 {
-  std::map<u32, int>::const_iterator iter = speedHacks.find(addr);
-  if (iter == speedHacks.end())
+  const auto iter = s_speed_hacks.find(addr);
+  if (iter == s_speed_hacks.end())
     return 0;
-  else
-    return iter->second;
+
+  return iter->second;
 }
 
 void LoadPatches()
@@ -162,13 +164,19 @@ void LoadPatches()
   IniFile globalIni = SConfig::GetInstance().LoadDefaultGameIni();
   IniFile localIni = SConfig::GetInstance().LoadLocalGameIni();
 
-  LoadPatchSection("OnFrame", onFrame, globalIni, localIni);
-  ActionReplay::LoadAndApplyCodes(globalIni, localIni);
+  LoadPatchSection("OnFrame", s_on_frame, globalIni, localIni);
 
-  // lil silly
-  std::vector<Gecko::GeckoCode> gcodes;
-  Gecko::LoadCodes(globalIni, localIni, gcodes);
-  Gecko::SetActiveCodes(gcodes);
+  // Check if I'm syncing Codes
+  if (Config::Get(Config::MAIN_CODE_SYNC_OVERRIDE))
+  {
+    Gecko::SetSyncedCodesAsActive();
+    ActionReplay::SetSyncedCodesAsActive();
+  }
+  else
+  {
+    Gecko::SetActiveCodes(Gecko::LoadCodes(globalIni, localIni));
+    ActionReplay::LoadAndApplyCodes(globalIni, localIni);
+  }
 
   LoadSpeedhacks("Speedhacks", merged);
 }
@@ -185,13 +193,13 @@ static void ApplyPatches(const std::vector<Patch>& patches)
         u32 value = entry.value;
         switch (entry.type)
         {
-        case PATCH_8BIT:
-          PowerPC::HostWrite_U8((u8)value, addr);
+        case PatchType::Patch8Bit:
+          PowerPC::HostWrite_U8(static_cast<u8>(value), addr);
           break;
-        case PATCH_16BIT:
-          PowerPC::HostWrite_U16((u16)value, addr);
+        case PatchType::Patch16Bit:
+          PowerPC::HostWrite_U16(static_cast<u16>(value), addr);
           break;
-        case PATCH_32BIT:
+        case PatchType::Patch32Bit:
           PowerPC::HostWrite_U32(value, addr);
           break;
         default:
@@ -203,30 +211,65 @@ static void ApplyPatches(const std::vector<Patch>& patches)
   }
 }
 
-void ApplyFramePatches()
+// Requires MSR.DR, MSR.IR
+// There's no perfect way to do this, it's just a heuristic.
+// We require at least 2 stack frames, if the stack is shallower than that then it won't work.
+static bool IsStackSane()
 {
-  // TODO: Messing with MSR this way is really, really, evil; we should
-  // probably be using some sort of Gecko OS-style hooking mechanism
-  // so the emulated CPU is in a predictable state when we process cheats.
-  u32 oldMSR = MSR;
-  UReg_MSR newMSR = oldMSR;
-  newMSR.IR = 1;
-  newMSR.DR = 1;
-  MSR = newMSR.Hex;
-  ApplyPatches(onFrame);
+  DEBUG_ASSERT(MSR.DR && MSR.IR);
+
+  // Check the stack pointer
+  u32 SP = GPR(1);
+  if (!PowerPC::HostIsRAMAddress(SP))
+    return false;
+
+  // Read the frame pointer from the stack (find 2nd frame from top), assert that it makes sense
+  u32 next_SP = PowerPC::HostRead_U32(SP);
+  if (next_SP <= SP || !PowerPC::HostIsRAMAddress(next_SP) ||
+      !PowerPC::HostIsRAMAddress(next_SP + 4))
+    return false;
+
+  // Check the link register makes sense (that it points to a valid IBAT address)
+  const u32 address = PowerPC::HostRead_U32(next_SP + 4);
+  return PowerPC::HostIsInstructionRAMAddress(address) && 0 != PowerPC::HostRead_U32(address);
+}
+
+bool ApplyFramePatches()
+{
+  // Because we're using the VI Interrupt to time this instead of patching the game with a
+  // callback hook we can end up catching the game in an exception vector.
+  // We deal with this by returning false so that SystemTimers will reschedule us in a few cycles
+  // where we can try again after the CPU hopefully returns back to the normal instruction flow.
+  if (!MSR.DR || !MSR.IR || !IsStackSane())
+  {
+    DEBUG_LOG(
+        ACTIONREPLAY,
+        "Need to retry later. CPU configuration is currently incorrect. PC = 0x%08X, MSR = 0x%08X",
+        PC, MSR.Hex);
+    return false;
+  }
+
+  ApplyPatches(s_on_frame);
 
   // Run the Gecko code handler
   Gecko::RunCodeHandler();
   ActionReplay::RunAllActive();
-  MSR = oldMSR;
+
+  return true;
 }
 
 void Shutdown()
 {
-  onFrame.clear();
-  speedHacks.clear();
+  s_on_frame.clear();
+  s_speed_hacks.clear();
   ActionReplay::ApplyCodes({});
-  Gecko::SetActiveCodes({});
+  Gecko::Shutdown();
+}
+
+void Reload()
+{
+  Shutdown();
+  LoadPatches();
 }
 
 }  // namespace

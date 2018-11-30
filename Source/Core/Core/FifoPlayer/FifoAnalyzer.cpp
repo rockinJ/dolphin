@@ -2,15 +2,16 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include "Core/FifoPlayer/FifoAnalyzer.h"
+
 #include <algorithm>
 #include <numeric>
 
-#include "Core/FifoPlayer/FifoAnalyzer.h"
-
 #include "Common/Assert.h"
-#include "Core/ConfigManager.h"
-#include "Core/Core.h"
+#include "Common/Swap.h"
+
 #include "Core/FifoPlayer/FifoRecordAnalyzer.h"
+
 #include "VideoCommon/OpcodeDecoding.h"
 #include "VideoCommon/VertexLoader.h"
 #include "VideoCommon/VertexLoader_Normal.h"
@@ -56,12 +57,12 @@ u32 AnalyzeCommand(const u8* data, DecodeMode mode)
 
   switch (cmd)
   {
-  case GX_NOP:
+  case OpcodeDecoder::GX_NOP:
   case 0x44:
-  case GX_CMD_INVL_VC:
+  case OpcodeDecoder::GX_CMD_INVL_VC:
     break;
 
-  case GX_LOAD_CP_REG:
+  case OpcodeDecoder::GX_LOAD_CP_REG:
   {
     s_DrawingObject = false;
 
@@ -71,7 +72,7 @@ u32 AnalyzeCommand(const u8* data, DecodeMode mode)
     break;
   }
 
-  case GX_LOAD_XF_REG:
+  case OpcodeDecoder::GX_LOAD_XF_REG:
   {
     s_DrawingObject = false;
 
@@ -82,14 +83,14 @@ u32 AnalyzeCommand(const u8* data, DecodeMode mode)
     break;
   }
 
-  case GX_LOAD_INDX_A:
-  case GX_LOAD_INDX_B:
-  case GX_LOAD_INDX_C:
-  case GX_LOAD_INDX_D:
+  case OpcodeDecoder::GX_LOAD_INDX_A:
+  case OpcodeDecoder::GX_LOAD_INDX_B:
+  case OpcodeDecoder::GX_LOAD_INDX_C:
+  case OpcodeDecoder::GX_LOAD_INDX_D:
   {
     s_DrawingObject = false;
 
-    int array = 0xc + (cmd - GX_LOAD_INDX_A) / 8;
+    int array = 0xc + (cmd - OpcodeDecoder::GX_LOAD_INDX_A) / 8;
     u32 value = ReadFifo32(data);
 
     if (mode == DECODE_RECORD)
@@ -97,15 +98,15 @@ u32 AnalyzeCommand(const u8* data, DecodeMode mode)
     break;
   }
 
-  case GX_CMD_CALL_DL:
+  case OpcodeDecoder::GX_CMD_CALL_DL:
     // The recorder should have expanded display lists into the fifo stream and skipped the call to
     // start them
     // That is done to make it easier to track where memory is updated
-    _assert_(false);
+    ASSERT(false);
     data += 8;
     break;
 
-  case GX_LOAD_BP_REG:
+  case OpcodeDecoder::GX_LOAD_BP_REG:
   {
     s_DrawingObject = false;
     ReadFifo32(data);
@@ -118,7 +119,7 @@ u32 AnalyzeCommand(const u8* data, DecodeMode mode)
       s_DrawingObject = true;
 
       int sizes[21];
-      FifoAnalyzer::CalculateVertexElementSizes(sizes, cmd & GX_VAT_MASK, s_CpMem);
+      CalculateVertexElementSizes(sizes, cmd & OpcodeDecoder::GX_VAT_MASK, s_CpMem);
 
       // Determine offset of each element that might be a vertex array
       // The first 9 elements are never vertex arrays so we just accumulate their sizes.
@@ -169,17 +170,17 @@ void LoadCPReg(u32 subCmd, u32 value, CPMemory& cpMem)
     break;
 
   case 0x70:
-    _assert_((subCmd & 0x0F) < 8);
+    ASSERT((subCmd & 0x0F) < 8);
     cpMem.vtxAttr[subCmd & 7].g0.Hex = value;
     break;
 
   case 0x80:
-    _assert_((subCmd & 0x0F) < 8);
+    ASSERT((subCmd & 0x0F) < 8);
     cpMem.vtxAttr[subCmd & 7].g1.Hex = value;
     break;
 
   case 0x90:
-    _assert_((subCmd & 0x0F) < 8);
+    ASSERT((subCmd & 0x0F) < 8);
     cpMem.vtxAttr[subCmd & 7].g2.Hex = value;
     break;
 
@@ -266,7 +267,7 @@ void CalculateVertexElementSizes(int sizes[], int vatIndex, const CPMemory& cpMe
         size = 4;
         break;
       default:
-        _assert_(0);
+        ASSERT(0);
         break;
       }
       break;

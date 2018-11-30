@@ -6,19 +6,14 @@
 
 #include <cstdarg>
 #include <cstring>
-#include <fstream>
-#include <iomanip>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "Common/CommonTypes.h"
-#include "Common/FileUtil.h"
-#include "Common/Logging/Log.h"
 #include "Common/StringUtil.h"
 #include "VideoCommon/VideoCommon.h"
 #include "VideoCommon/VideoConfig.h"
-#include "VideoCommon/XFMemory.h"
 
 /**
  * Common interface for classes that need to go through the shader generation path
@@ -103,8 +98,10 @@ public:
   const uid_data* GetUidData() const { return &data; }
   const u8* GetUidDataRaw() const { return &values[0]; }
   size_t GetUidDataSize() const { return sizeof(values); }
+
 private:
-  union {
+  union
+  {
     uid_data data;
     u8 values[sizeof(uid_data)];
   };
@@ -155,17 +152,56 @@ private:
   std::vector<bool> constant_usage;  // TODO: Is vector<bool> appropriate here?
 };
 
+// Host config contains the settings which can influence generated shaders.
+union ShaderHostConfig
+{
+  u32 bits;
+
+  struct
+  {
+    u32 msaa : 1;
+    u32 ssaa : 1;
+    u32 stereo : 1;
+    u32 wireframe : 1;
+    u32 per_pixel_lighting : 1;
+    u32 vertex_rounding : 1;
+    u32 fast_depth_calc : 1;
+    u32 bounding_box : 1;
+    u32 backend_dual_source_blend : 1;
+    u32 backend_geometry_shaders : 1;
+    u32 backend_early_z : 1;
+    u32 backend_bbox : 1;
+    u32 backend_gs_instancing : 1;
+    u32 backend_clip_control : 1;
+    u32 backend_ssaa : 1;
+    u32 backend_atomics : 1;
+    u32 backend_depth_clamp : 1;
+    u32 backend_reversed_depth_range : 1;
+    u32 backend_bitfield : 1;
+    u32 backend_dynamic_sampler_indexing : 1;
+    u32 backend_shader_framebuffer_fetch : 1;
+    u32 backend_logic_op : 1;
+    u32 pad : 10;
+  };
+
+  static ShaderHostConfig GetCurrent();
+};
+
+// Gets the filename of the specified type of cache object (e.g. vertex shader, pipeline).
+std::string GetDiskShaderCacheFileName(APIType api_type, const char* type, bool include_gameid,
+                                       bool include_host_config, bool include_api = true);
+
 template <class T>
-inline void DefineOutputMember(T& object, API_TYPE api_type, const char* qualifier,
-                               const char* type, const char* name, int var_index,
-                               const char* semantic = "", int semantic_index = -1)
+inline void DefineOutputMember(T& object, APIType api_type, const char* qualifier, const char* type,
+                               const char* name, int var_index, const char* semantic = "",
+                               int semantic_index = -1)
 {
   object.Write("\t%s %s %s", qualifier, type, name);
 
   if (var_index != -1)
     object.Write("%d", var_index);
 
-  if (api_type == API_D3D && strlen(semantic) > 0)
+  if (api_type == APIType::D3D && strlen(semantic) > 0)
   {
     if (semantic_index != -1)
       object.Write(" : %s%d", semantic, semantic_index);
@@ -177,7 +213,7 @@ inline void DefineOutputMember(T& object, API_TYPE api_type, const char* qualifi
 }
 
 template <class T>
-inline void GenerateVSOutputMembers(T& object, API_TYPE api_type, u32 texgens,
+inline void GenerateVSOutputMembers(T& object, APIType api_type, u32 texgens,
                                     bool per_pixel_lighting, const char* qualifier)
 {
   DefineOutputMember(object, api_type, qualifier, "float4", "pos", -1, "POSITION");
@@ -196,6 +232,9 @@ inline void GenerateVSOutputMembers(T& object, API_TYPE api_type, u32 texgens,
     DefineOutputMember(object, api_type, qualifier, "float3", "WorldPos", -1, "TEXCOORD",
                        texgens + 2);
   }
+
+  DefineOutputMember(object, api_type, qualifier, "float", "clipDist", 0, "SV_ClipDistance", 0);
+  DefineOutputMember(object, api_type, qualifier, "float", "clipDist", 1, "SV_ClipDistance", 1);
 }
 
 template <class T>
@@ -216,6 +255,9 @@ inline void AssignVSOutputMembers(T& object, const char* a, const char* b, u32 t
     object.Write("\t%s.Normal = %s.Normal;\n", a, b);
     object.Write("\t%s.WorldPos = %s.WorldPos;\n", a, b);
   }
+
+  object.Write("\t%s.clipDist0 = %s.clipDist0;\n", a, b);
+  object.Write("\t%s.clipDist1 = %s.clipDist1;\n", a, b);
 }
 
 // We use the flag "centroid" to fix some MSAA rendering bugs. With MSAA, the
@@ -261,6 +303,7 @@ inline const char* GetInterpolationQualifier(bool msaa, bool ssaa,
 #define I_FOGCOLOR "cfogcolor"
 #define I_FOGI "cfogi"
 #define I_FOGF "cfogf"
+#define I_FOGRANGE "cfogrange"
 #define I_ZSLOPE "czslope"
 #define I_EFBSCALE "cefbscale"
 
@@ -273,12 +316,16 @@ inline const char* GetInterpolationQualifier(bool msaa, bool ssaa,
 #define I_NORMALMATRICES "cnmtx"
 #define I_POSTTRANSFORMMATRICES "cpostmtx"
 #define I_PIXELCENTERCORRECTION "cpixelcenter"
+#define I_VIEWPORT_SIZE "cviewport"
 
 #define I_STEREOPARAMS "cstereo"
 #define I_LINEPTPARAMS "clinept"
 #define I_TEXOFFSET "ctexoffset"
 
-static const char s_shader_uniforms[] = "\tfloat4 " I_POSNORMALMATRIX "[6];\n"
+static const char s_shader_uniforms[] = "\tuint    components;\n"
+                                        "\tuint    xfmem_dualTexInfo;\n"
+                                        "\tuint    xfmem_numColorChans;\n"
+                                        "\tfloat4 " I_POSNORMALMATRIX "[6];\n"
                                         "\tfloat4 " I_PROJECTION "[4];\n"
                                         "\tint4 " I_MATERIALS "[4];\n"
                                         "\tLight " I_LIGHTS "[8];\n"
@@ -286,4 +333,10 @@ static const char s_shader_uniforms[] = "\tfloat4 " I_POSNORMALMATRIX "[6];\n"
                                         "\tfloat4 " I_TRANSFORMMATRICES "[64];\n"
                                         "\tfloat4 " I_NORMALMATRICES "[32];\n"
                                         "\tfloat4 " I_POSTTRANSFORMMATRICES "[64];\n"
-                                        "\tfloat4 " I_PIXELCENTERCORRECTION ";\n";
+                                        "\tfloat4 " I_PIXELCENTERCORRECTION ";\n"
+                                        "\tfloat2 " I_VIEWPORT_SIZE ";\n"
+                                        "\tuint4   xfmem_pack1[8];\n"
+                                        "\t#define xfmem_texMtxInfo(i) (xfmem_pack1[(i)].x)\n"
+                                        "\t#define xfmem_postMtxInfo(i) (xfmem_pack1[(i)].y)\n"
+                                        "\t#define xfmem_color(i) (xfmem_pack1[(i)].z)\n"
+                                        "\t#define xfmem_alpha(i) (xfmem_pack1[(i)].w)\n";

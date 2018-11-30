@@ -7,19 +7,22 @@
 #include "VideoCommon/AsyncRequests.h"
 #include "VideoCommon/Fifo.h"
 #include "VideoCommon/RenderBase.h"
+#include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VideoBackendBase.h"
 #include "VideoCommon/VideoCommon.h"
 
 AsyncRequests AsyncRequests::s_singleton;
 
-AsyncRequests::AsyncRequests() : m_enable(false), m_passthrough(true)
-{
-}
+AsyncRequests::AsyncRequests() = default;
 
 void AsyncRequests::PullEventsInternal()
 {
+  // This is only called if the queue isn't empty.
+  // So just flush the pipeline to get accurate results.
+  g_vertex_manager->Flush();
+
   std::unique_lock<std::mutex> lock(m_mutex);
-  m_empty.store(true);
+  m_empty.Set();
 
   while (!m_queue.empty())
   {
@@ -31,7 +34,8 @@ void AsyncRequests::PullEventsInternal()
     {
       m_merged_efb_pokes.clear();
       Event first_event = m_queue.front();
-      EFBAccessType t = first_event.type == Event::EFB_POKE_COLOR ? POKE_COLOR : POKE_Z;
+      const auto t = first_event.type == Event::EFB_POKE_COLOR ? EFBAccessType::PokeColor :
+                                                                 EFBAccessType::PokeZ;
 
       do
       {
@@ -76,7 +80,7 @@ void AsyncRequests::PushEvent(const AsyncRequests::Event& event, bool blocking)
     return;
   }
 
-  m_empty.store(false);
+  m_empty.Clear();
   m_wake_me_up_again |= blocking;
 
   if (!m_enable)
@@ -114,28 +118,29 @@ void AsyncRequests::HandleEvent(const AsyncRequests::Event& e)
   case Event::EFB_POKE_COLOR:
   {
     EfbPokeData poke = {e.efb_poke.x, e.efb_poke.y, e.efb_poke.data};
-    g_renderer->PokeEFB(POKE_COLOR, &poke, 1);
+    g_renderer->PokeEFB(EFBAccessType::PokeColor, &poke, 1);
   }
   break;
 
   case Event::EFB_POKE_Z:
   {
     EfbPokeData poke = {e.efb_poke.x, e.efb_poke.y, e.efb_poke.data};
-    g_renderer->PokeEFB(POKE_Z, &poke, 1);
+    g_renderer->PokeEFB(EFBAccessType::PokeZ, &poke, 1);
   }
   break;
 
   case Event::EFB_PEEK_COLOR:
-    *e.efb_peek.data = g_renderer->AccessEFB(PEEK_COLOR, e.efb_peek.x, e.efb_peek.y, 0);
+    *e.efb_peek.data =
+        g_renderer->AccessEFB(EFBAccessType::PeekColor, e.efb_peek.x, e.efb_peek.y, 0);
     break;
 
   case Event::EFB_PEEK_Z:
-    *e.efb_peek.data = g_renderer->AccessEFB(PEEK_Z, e.efb_peek.x, e.efb_peek.y, 0);
+    *e.efb_peek.data = g_renderer->AccessEFB(EFBAccessType::PeekZ, e.efb_peek.x, e.efb_peek.y, 0);
     break;
 
   case Event::SWAP_EVENT:
-    Renderer::Swap(e.swap_event.xfbAddr, e.swap_event.fbWidth, e.swap_event.fbStride,
-                   e.swap_event.fbHeight, rc);
+    g_renderer->Swap(e.swap_event.xfbAddr, e.swap_event.fbWidth, e.swap_event.fbStride,
+                     e.swap_event.fbHeight, rc, e.time);
     break;
 
   case Event::BBOX_READ:

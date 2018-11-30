@@ -19,8 +19,11 @@
 // copy, etc
 // -------------------------------------------------------------------------------------------------------------
 
+#include "Core/ActionReplay.h"
+
 #include <algorithm>
 #include <atomic>
+#include <cstdarg>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -28,16 +31,16 @@
 #include <utility>
 #include <vector>
 
+#include "Common/BitUtils.h"
 #include "Common/CommonTypes.h"
 #include "Common/IniFile.h"
-#include "Common/Logging/LogManager.h"
+#include "Common/Logging/Log.h"
+#include "Common/MsgHandler.h"
 #include "Common/StringUtil.h"
 
 #include "Core/ARDecrypt.h"
-#include "Core/ActionReplay.h"
 #include "Core/ConfigManager.h"
-#include "Core/Core.h"
-#include "Core/PowerPC/PowerPC.h"
+#include "Core/PowerPC/MMU.h"
 
 namespace ActionReplay
 {
@@ -80,6 +83,7 @@ enum
 // General lock. Protects codes list and internal log.
 static std::mutex s_lock;
 static std::vector<ARCode> s_active_codes;
+static std::vector<ARCode> s_synced_codes;
 static std::vector<std::string> s_internal_log;
 static std::atomic<bool> s_use_internal_log{false};
 // pointer to the code currently being run, (used by log messages that include the code name)
@@ -88,7 +92,8 @@ static bool s_disable_logging = false;
 
 struct ARAddr
 {
-  union {
+  union
+  {
     u32 address;
     struct
     {
@@ -117,6 +122,37 @@ void ApplyCodes(const std::vector<ARCode>& codes)
   std::copy_if(codes.begin(), codes.end(), std::back_inserter(s_active_codes),
                [](const ARCode& code) { return code.active; });
   s_active_codes.shrink_to_fit();
+}
+
+void SetSyncedCodesAsActive()
+{
+  s_active_codes.clear();
+  s_active_codes.reserve(s_synced_codes.size());
+  s_active_codes = s_synced_codes;
+}
+
+void UpdateSyncedCodes(const std::vector<ARCode>& codes)
+{
+  s_synced_codes.clear();
+  s_synced_codes.reserve(codes.size());
+  std::copy_if(codes.begin(), codes.end(), std::back_inserter(s_synced_codes),
+               [](const ARCode& code) { return code.active; });
+  s_synced_codes.shrink_to_fit();
+}
+
+std::vector<ARCode> ApplyAndReturnCodes(const std::vector<ARCode>& codes)
+{
+  if (SConfig::GetInstance().bEnableCheats)
+  {
+    std::lock_guard<std::mutex> guard(s_lock);
+    s_disable_logging = false;
+    s_active_codes.clear();
+    std::copy_if(codes.begin(), codes.end(), std::back_inserter(s_active_codes),
+                 [](const ARCode& code) { return code.active; });
+  }
+  s_active_codes.shrink_to_fit();
+
+  return s_active_codes;
 }
 
 void AddCode(ARCode code)
@@ -172,8 +208,6 @@ std::vector<ARCode> LoadCodes(const IniFile& global_ini, const IniFile& local_in
         continue;
       }
 
-      std::vector<std::string> pieces;
-
       // Check if the line is a name of the code
       if (line[0] == '$')
       {
@@ -184,7 +218,7 @@ std::vector<ARCode> LoadCodes(const IniFile& global_ini, const IniFile& local_in
         }
         if (encrypted_lines.size())
         {
-          DecryptARCode(encrypted_lines, current_code.ops);
+          DecryptARCode(encrypted_lines, &current_code.ops);
           codes.push_back(current_code);
           current_code.ops.clear();
           encrypted_lines.clear();
@@ -196,7 +230,7 @@ std::vector<ARCode> LoadCodes(const IniFile& global_ini, const IniFile& local_in
       }
       else
       {
-        SplitString(line, ' ', pieces);
+        std::vector<std::string> pieces = SplitString(line, ' ');
 
         // Check if the AR code is decrypted
         if (pieces.size() == 2 && pieces[0].size() == 8 && pieces[1].size() == 8)
@@ -222,7 +256,7 @@ std::vector<ARCode> LoadCodes(const IniFile& global_ini, const IniFile& local_in
         }
         else
         {
-          SplitString(line, '-', pieces);
+          pieces = SplitString(line, '-');
           if (pieces.size() == 3 && pieces[0].size() == 4 && pieces[1].size() == 4 &&
               pieces[2].size() == 5)
           {
@@ -242,7 +276,7 @@ std::vector<ARCode> LoadCodes(const IniFile& global_ini, const IniFile& local_in
     }
     if (encrypted_lines.size())
     {
-      DecryptARCode(encrypted_lines, current_code.ops);
+      DecryptARCode(encrypted_lines, &current_code.ops);
       codes.push_back(current_code);
     }
   }
@@ -277,7 +311,7 @@ static void LogInfo(const char* format, ...)
   if (s_disable_logging)
     return;
   bool use_internal_log = s_use_internal_log.load(std::memory_order_relaxed);
-  if (LogManager::GetMaxLevel() < LogTypes::LINFO && !use_internal_log)
+  if (MAX_LOGLEVEL < LogTypes::LINFO && !use_internal_log)
     return;
 
   va_list args;
@@ -447,7 +481,7 @@ static bool Subtype_AddCode(const ARAddr& addr, const u32 data)
     LogInfo("8-bit Add");
     LogInfo("--------");
     PowerPC::HostWrite_U8(PowerPC::HostRead_U8(new_addr) + data, new_addr);
-    LogInfo("Wrote %08x to address %08x", PowerPC::HostRead_U8(new_addr) + (data & 0xFF), new_addr);
+    LogInfo("Wrote %02x to address %08x", PowerPC::HostRead_U8(new_addr), new_addr);
     LogInfo("--------");
     break;
 
@@ -455,8 +489,7 @@ static bool Subtype_AddCode(const ARAddr& addr, const u32 data)
     LogInfo("16-bit Add");
     LogInfo("--------");
     PowerPC::HostWrite_U16(PowerPC::HostRead_U16(new_addr) + data, new_addr);
-    LogInfo("Wrote %08x to address %08x", PowerPC::HostRead_U16(new_addr) + (data & 0xFFFF),
-            new_addr);
+    LogInfo("Wrote %04x to address %08x", PowerPC::HostRead_U16(new_addr), new_addr);
     LogInfo("--------");
     break;
 
@@ -464,7 +497,7 @@ static bool Subtype_AddCode(const ARAddr& addr, const u32 data)
     LogInfo("32-bit Add");
     LogInfo("--------");
     PowerPC::HostWrite_U32(PowerPC::HostRead_U32(new_addr) + data, new_addr);
-    LogInfo("Wrote %08x to address %08x", PowerPC::HostRead_U32(new_addr) + data, new_addr);
+    LogInfo("Wrote %08x to address %08x", PowerPC::HostRead_U32(new_addr), new_addr);
     LogInfo("--------");
     break;
 
@@ -474,10 +507,10 @@ static bool Subtype_AddCode(const ARAddr& addr, const u32 data)
     LogInfo("--------");
 
     const u32 read = PowerPC::HostRead_U32(new_addr);
-    const float read_float = reinterpret_cast<const float&>(read);
+    const float read_float = Common::BitCast<float>(read);
     // data contains an (unsigned?) integer value
     const float fread = read_float + static_cast<float>(data);
-    const u32 newval = reinterpret_cast<const u32&>(fread);
+    const u32 newval = Common::BitCast<u32>(fread);
     PowerPC::HostWrite_U32(newval, new_addr);
     LogInfo("Old Value %08x", read);
     LogInfo("Increment %08x", data);
@@ -585,10 +618,12 @@ static bool ZeroCode_FillAndSlide(const u32 val_last, const ARAddr& addr, const 
   return true;
 }
 
-// Looks like this is new?? - untested
+// kenobi's "memory copy" Z-code. Requires an additional master code
+// on a real AR device. Documented here:
+// https://github.com/dolphin-emu/dolphin/wiki/GameCube-Action-Replay-Code-Types#type-z4-size-3--memory-copy
 static bool ZeroCode_MemoryCopy(const u32 val_last, const ARAddr& addr, const u32 data)
 {
-  const u32 addr_dest = val_last | 0x06000000;
+  const u32 addr_dest = val_last & ~0x06000000;
   const u32 addr_src = addr.GCAddress();
 
   const u8 num_bytes = data & 0x7FFF;
@@ -597,16 +632,20 @@ static bool ZeroCode_MemoryCopy(const u32 val_last, const ARAddr& addr, const u3
   LogInfo("Src Address: %08x", addr_src);
   LogInfo("Size: %08x", num_bytes);
 
-  if ((data & ~0x7FFF) == 0x0000)
+  if ((data & 0xFF0000) == 0)
   {
     if ((data >> 24) != 0x0)
     {  // Memory Copy With Pointers Support
       LogInfo("Memory Copy With Pointers Support");
       LogInfo("--------");
-      for (int i = 0; i < 138; ++i)
+      const u32 ptr_dest = PowerPC::HostRead_U32(addr_dest);
+      LogInfo("Resolved Dest Address to: %08x", ptr_dest);
+      const u32 ptr_src = PowerPC::HostRead_U32(addr_src);
+      LogInfo("Resolved Src Address to: %08x", ptr_src);
+      for (int i = 0; i < num_bytes; ++i)
       {
-        PowerPC::HostWrite_U8(PowerPC::HostRead_U8(addr_src + i), addr_dest + i);
-        LogInfo("Wrote %08x to address %08x", PowerPC::HostRead_U8(addr_src + i), addr_dest + i);
+        PowerPC::HostWrite_U8(PowerPC::HostRead_U8(ptr_src + i), ptr_dest + i);
+        LogInfo("Wrote %08x to address %08x", PowerPC::HostRead_U8(ptr_src + i), ptr_dest + i);
       }
       LogInfo("--------");
     }

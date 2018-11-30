@@ -21,7 +21,7 @@ static bool s_viewport_changed;
 
 void GeometryShaderManager::Init()
 {
-  memset(&constants, 0, sizeof(constants));
+  constants = {};
 
   // Init any intial constants which aren't zero when bpmem is zero.
   SetViewportChanged();
@@ -41,7 +41,7 @@ void GeometryShaderManager::Dirty()
 
 void GeometryShaderManager::SetConstants()
 {
-  if (s_projection_changed && g_ActiveConfig.iStereoMode > 0)
+  if (s_projection_changed && g_ActiveConfig.stereo_mode != StereoMode::Off)
   {
     s_projection_changed = false;
 

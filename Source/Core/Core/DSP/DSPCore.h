@@ -7,12 +7,21 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <memory>
 #include <string>
 
 #include "Core/DSP/DSPBreakpoints.h"
 #include "Core/DSP/DSPCaptureLogger.h"
-#include "Core/DSP/DSPEmitter.h"
+
+namespace DSP
+{
+class Accelerator;
+
+namespace JIT
+{
+class DSPEmitter;
+}
 
 enum : u32
 {
@@ -151,11 +160,12 @@ enum : u32
   DSP_CMBL = 0xff   // CPU Mailbox L
 };
 
-// Stacks
-enum : int
+enum class StackRegister
 {
-  DSP_STACK_C,
-  DSP_STACK_D
+  Call,
+  Data,
+  LoopAddress,
+  LoopCounter
 };
 
 // cr (Not g_dsp.r[CR]) bits
@@ -195,15 +205,15 @@ enum : u16
 };
 
 // Exception vectors
-enum : int
+enum class ExceptionType
 {
-  EXP_STOVF = 1,  // 0x0002 stack under/over flow
-  EXP_2 = 2,      // 0x0004
-  EXP_3 = 3,      // 0x0006
-  EXP_4 = 4,      // 0x0008
-  EXP_ACCOV = 5,  // 0x000a accelerator address overflow
-  EXP_6 = 6,      // 0x000c
-  EXP_INT = 7     // 0x000e external int (message from CPU)
+  StackOverflow = 1,        // 0x0002 stack under/over flow
+  EXP_2 = 2,                // 0x0004
+  EXP_3 = 3,                // 0x0006
+  EXP_4 = 4,                // 0x0008
+  AcceleratorOverflow = 5,  // 0x000a accelerator address overflow
+  EXP_6 = 6,                // 0x000c
+  ExternalInterrupt = 7     // 0x000e external int (message from CPU)
 };
 
 struct DSP_Regs
@@ -215,7 +225,8 @@ struct DSP_Regs
   u16 cr;
   u16 sr;
 
-  union {
+  union
+  {
     u64 val;
     struct
     {
@@ -226,7 +237,8 @@ struct DSP_Regs
     };
   } prod;
 
-  union {
+  union
+  {
     u32 val;
     struct
     {
@@ -235,7 +247,8 @@ struct DSP_Regs
     };
   } ax[2];
 
-  union {
+  union
+  {
     u64 val;
     struct
     {
@@ -285,6 +298,8 @@ struct SDSP
   // Accelerator / DMA / other hardware registers. Not GPRs.
   std::array<u16, 256> ifx_regs;
 
+  std::unique_ptr<Accelerator> accelerator;
+
   // When state saving, all of the above can just be memcpy'd into the save state.
   // The below needs special handling.
   u16* iram;
@@ -298,9 +313,8 @@ struct SDSP
 
 extern SDSP g_dsp;
 extern DSPBreakpoints g_dsp_breakpoints;
-extern u16 g_cycles_left;
 extern bool g_init_hax;
-extern std::unique_ptr<DSPEmitter> g_dsp_jit;
+extern std::unique_ptr<JIT::DSPEmitter> g_dsp_jit;
 extern std::unique_ptr<DSPCaptureLogger> g_dsp_cap;
 
 struct DSPInitOptions
@@ -312,19 +326,19 @@ struct DSPInitOptions
   std::array<u16, DSP_COEF_SIZE> coef_contents;
 
   // Core used to emulate the DSP.
-  // Default: CORE_JIT.
-  enum CoreType
+  // Default: JIT64.
+  enum class CoreType
   {
-    CORE_INTERPRETER,
-    CORE_JIT,
+    Interpreter,
+    JIT64,
   };
-  CoreType core_type;
+  CoreType core_type = CoreType::JIT64;
 
   // Optional capture logger used to log internal DSP data transfers.
   // Default: dummy implementation, does nothing.
   DSPCaptureLogger* capture_logger;
 
-  DSPInitOptions() : core_type(CORE_JIT), capture_logger(new DefaultDSPCaptureLogger()) {}
+  DSPInitOptions() : capture_logger(new DefaultDSPCaptureLogger()) {}
 };
 
 // Initializes the DSP emulator using the provided options. Takes ownership of
@@ -339,24 +353,23 @@ void DSPCore_CheckExceptions();
 void DSPCore_SetExternalInterrupt(bool val);
 
 // sets a flag in the pending exception register.
-void DSPCore_SetException(u8 level);
+void DSPCore_SetException(ExceptionType exception);
 
-void CompileCurrent();
-
-enum DSPCoreState
+enum class State
 {
-  DSPCORE_STOP = 0,
-  DSPCORE_RUNNING,
-  DSPCORE_STEPPING,
+  Stopped,
+  Running,
+  Stepping,
 };
 
 int DSPCore_RunCycles(int cycles);
 
 // These are meant to be called from the UI thread.
-void DSPCore_SetState(DSPCoreState new_state);
-DSPCoreState DSPCore_GetState();
+void DSPCore_SetState(State new_state);
+State DSPCore_GetState();
 
 void DSPCore_Step();
 
-u16 DSPCore_ReadRegister(int reg);
-void DSPCore_WriteRegister(int reg, u16 val);
+u16 DSPCore_ReadRegister(size_t reg);
+void DSPCore_WriteRegister(size_t reg, u16 val);
+}  // namespace DSP

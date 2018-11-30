@@ -4,14 +4,15 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <string>
 #include <type_traits>
 
-#include "Common/Common.h"
 #include "Common/CommonTypes.h"
 #include "Common/FileUtil.h"
+#include "Common/Version.h"
 
 // On disk format:
 // header{
@@ -55,22 +56,16 @@ public:
   {
     using std::ios_base;
 
-// Since we're reading/writing directly to the storage of K instances,
-// K must be trivially copyable. TODO: Remove #if once GCC 5.0 is a
-// minimum requirement.
-#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ < 5
-    static_assert(std::has_trivial_copy_constructor<K>::value,
-                  "K must be a trivially copyable type");
-#else
+    // Since we're reading/writing directly to the storage of K instances,
+    // K must be trivially copyable.
     static_assert(std::is_trivially_copyable<K>::value, "K must be a trivially copyable type");
-#endif
 
     // close any currently opened file
     Close();
     m_num_entries = 0;
 
     // try opening for reading/writing
-    OpenFStream(m_file, filename, ios_base::in | ios_base::out | ios_base::binary);
+    File::OpenFStream(m_file, filename, ios_base::in | ios_base::out | ios_base::binary);
 
     m_file.seekg(0, std::ios::end);
     std::fstream::pos_type end_pos = m_file.tellg();
@@ -123,7 +118,7 @@ public:
     // failed to open file for reading or bad header
     // close and recreate file
     Close();
-    m_file.open(filename, ios_base::out | ios_base::trunc | ios_base::binary);
+    File::OpenFStream(m_file, filename, ios_base::out | ios_base::trunc | ios_base::binary);
     WriteHeader();
     return 0;
   }
@@ -162,13 +157,13 @@ private:
   template <typename D>
   bool Write(const D* data, u32 count = 1)
   {
-    return m_file.write((const char*)data, count * sizeof(D)).good();
+    return m_file.write(reinterpret_cast<const char*>(data), count * sizeof(D)).good();
   }
 
   template <typename D>
-  bool Read(const D* data, u32 count = 1)
+  bool Read(D* data, u32 count = 1)
   {
-    return m_file.read((char*)data, count * sizeof(D)).good();
+    return m_file.read(reinterpret_cast<char*>(data), count * sizeof(D)).good();
   }
 
   struct Header
@@ -177,7 +172,8 @@ private:
     {
       // Null-terminator is intentionally not copied.
       std::memcpy(&id, "DCAC", sizeof(u32));
-      std::memcpy(ver, scm_rev_git_str.c_str(), std::min(scm_rev_git_str.size(), sizeof(ver)));
+      std::memcpy(ver, Common::scm_rev_git_str.c_str(),
+                  std::min(Common::scm_rev_git_str.size(), sizeof(ver)));
     }
 
     u32 id;

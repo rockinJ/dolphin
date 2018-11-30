@@ -61,7 +61,7 @@ void JitArm64::ps_mergeXX(UGeckoInstruction inst)
     m_float_emit.TRN2(size, VD, VA, VB);
     break;
   default:
-    _assert_msg_(DYNA_REC, 0, "ps_merge - invalid op");
+    ASSERT_MSG(DYNA_REC, 0, "ps_merge - invalid op");
     break;
   }
 }
@@ -85,13 +85,10 @@ void JitArm64::ps_mulsX(UGeckoInstruction inst)
   ARM64Reg VA = fpr.R(a, type);
   ARM64Reg VC = fpr.R(c, type);
   ARM64Reg VD = fpr.RW(d, type);
-  ARM64Reg V0 = fpr.GetReg();
 
-  m_float_emit.DUP(size, reg_encoder(V0), reg_encoder(VC), upper ? 1 : 0);
-  m_float_emit.FMUL(size, reg_encoder(VD), reg_encoder(VA), reg_encoder(V0));
+  m_float_emit.FMUL(size, reg_encoder(VD), reg_encoder(VA), reg_encoder(VC), upper ? 1 : 0);
 
   fpr.FixSinglePrecision(d);
-  fpr.Unlock(V0);
 }
 
 void JitArm64::ps_maddXX(UGeckoInstruction inst)
@@ -121,13 +118,11 @@ void JitArm64::ps_maddXX(UGeckoInstruction inst)
   switch (op5)
   {
   case 14:  // ps_madds0
-    m_float_emit.DUP(size, V0, VC, 0);
-    m_float_emit.FMUL(size, V0, V0, VA);
+    m_float_emit.FMUL(size, V0, VA, VC, 0);
     m_float_emit.FADD(size, VD, V0, VB);
     break;
   case 15:  // ps_madds1
-    m_float_emit.DUP(size, V0, VC, 1);
-    m_float_emit.FMUL(size, V0, V0, VA);
+    m_float_emit.FMUL(size, V0, VA, VC, 1);
     m_float_emit.FADD(size, VD, V0, VB);
     break;
   case 28:  // ps_msub
@@ -149,34 +144,12 @@ void JitArm64::ps_maddXX(UGeckoInstruction inst)
     m_float_emit.FNEG(size, VD, VD);
     break;
   default:
-    _assert_msg_(DYNA_REC, 0, "ps_madd - invalid op");
+    ASSERT_MSG(DYNA_REC, 0, "ps_madd - invalid op");
     break;
   }
   fpr.FixSinglePrecision(d);
 
   fpr.Unlock(V0Q);
-}
-
-void JitArm64::ps_res(UGeckoInstruction inst)
-{
-  INSTRUCTION_START
-  JITDISABLE(bJITPairedOff);
-  FALLBACK_IF(inst.Rc);
-  FALLBACK_IF(SConfig::GetInstance().bFPRF && js.op->wantsFPRF);
-
-  u32 b = inst.FB, d = inst.FD;
-
-  bool singles = fpr.IsSingle(b);
-  RegType type = singles ? REG_REG_SINGLE : REG_REG;
-  u8 size = singles ? 32 : 64;
-  ARM64Reg (*reg_encoder)(ARM64Reg) = singles ? EncodeRegToDouble : EncodeRegToQuad;
-
-  ARM64Reg VB = fpr.R(b, type);
-  ARM64Reg VD = fpr.RW(d, type);
-
-  m_float_emit.FRSQRTE(size, reg_encoder(VD), reg_encoder(VB));
-
-  fpr.FixSinglePrecision(d);
 }
 
 void JitArm64::ps_sel(UGeckoInstruction inst)

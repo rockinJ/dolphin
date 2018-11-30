@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cstring>
 #include <functional>
 
 #include "Common/ArmCommon.h"
@@ -276,15 +277,6 @@ constexpr ARM64Reg EncodeRegToQuad(ARM64Reg reg)
   return static_cast<ARM64Reg>(reg | 0xC0);
 }
 
-// For AND/TST/ORR/EOR etc
-bool IsImmLogical(uint64_t value, unsigned int width, unsigned int* n, unsigned int* imm_s,
-                  unsigned int* imm_r);
-// For ADD/SUB
-bool IsImmArithmetic(uint64_t input, u32* val, bool* shift);
-
-float FPImm8ToFloat(uint8_t bits);
-bool FPImm8FromFloat(float value, uint8_t* immOut);
-
 enum OpType
 {
   TYPE_IMM = 0,
@@ -489,7 +481,7 @@ public:
       return (m_shifttype << 22) | (m_shift << 10);
       break;
     default:
-      _dbg_assert_msg_(DYNA_REC, false, "Invalid type in GetData");
+      DEBUG_ASSERT_MSG(DYNA_REC, false, "Invalid type in GetData");
       break;
     }
     return 0;
@@ -504,6 +496,7 @@ private:
   u8* m_code;
   u8* m_lastCacheFlushEnd;
 
+  void AddImmediate(ARM64Reg Rd, ARM64Reg Rn, u64 imm, bool shift, bool negative, bool flags);
   void EncodeCompareBranchInst(u32 op, ARM64Reg Rt, const void* ptr);
   void EncodeTestBranchInst(u32 op, ARM64Reg Rt, u8 bits, const void* ptr);
   void EncodeUnconditionalBranchInst(u32 op, const void* ptr);
@@ -550,8 +543,8 @@ public:
   void SetCodePtr(u8* ptr);
   void SetCodePtrUnsafe(u8* ptr);
   void ReserveCodeSpace(u32 bytes);
-  const u8* AlignCode16();
-  const u8* AlignCodePage();
+  u8* AlignCode16();
+  u8* AlignCodePage();
   const u8* GetCodePtr() const;
   void FlushIcache();
   void FlushIcacheSection(u8* start, u8* end);
@@ -601,9 +594,9 @@ public:
 
   // System
   void _MSR(PStateField field, u8 imm);
-
   void _MSR(PStateField field, ARM64Reg Rt);
   void MRS(ARM64Reg Rt, PStateField field);
+  void CNTVCT(ARM64Reg Rt);
 
   void HINT(SystemHint op);
   void CLREX();
@@ -650,6 +643,11 @@ public:
   {
     ARM64Reg zr = Is64Bit(Rd) ? ZR : WZR;
     CSINC(Rd, zr, zr, (CCFlags)((u32)cond ^ 1));
+  }
+  void CSETM(ARM64Reg Rd, CCFlags cond)
+  {
+    ARM64Reg zr = Is64Bit(Rd) ? ZR : WZR;
+    CSINV(Rd, zr, zr, (CCFlags)((u32)cond ^ 1));
   }
   void NEG(ARM64Reg Rd, ARM64Reg Rs) { SUB(Rd, Is64Bit(Rd) ? ZR : WZR, Rs); }
   // Data-Processing 1 source
@@ -714,7 +712,7 @@ public:
   void MOV(ARM64Reg Rd, ARM64Reg Rm);
   void MVN(ARM64Reg Rd, ARM64Reg Rm);
 
-  // TODO: These are "slow" as they use arith+shift, should be replaced with UBFM/EXTR variants.
+  // Convenience wrappers around UBFM/EXTR.
   void LSR(ARM64Reg Rd, ARM64Reg Rm, int shift);
   void LSL(ARM64Reg Rd, ARM64Reg Rm, int shift);
   void ASR(ARM64Reg Rd, ARM64Reg Rm, int shift);
@@ -835,10 +833,11 @@ public:
 
   // Wrapper around MOVZ+MOVK
   void MOVI2R(ARM64Reg Rd, u64 imm, bool optimize = true);
+  bool MOVI2R2(ARM64Reg Rd, u64 imm1, u64 imm2);
   template <class P>
   void MOVP2R(ARM64Reg Rd, P* ptr)
   {
-    _assert_msg_(DYNA_REC, Is64Bit(Rd), "Can't store pointers in 32-bit registers");
+    ASSERT_MSG(DYNA_REC, Is64Bit(Rd), "Can't store pointers in 32-bit registers");
     MOVI2R(Rd, (uintptr_t)ptr);
   }
 
@@ -854,7 +853,10 @@ public:
   void EORI2R(ARM64Reg Rd, ARM64Reg Rn, u64 imm, ARM64Reg scratch = INVALID_REG);
   void CMPI2R(ARM64Reg Rn, u64 imm, ARM64Reg scratch = INVALID_REG);
 
+  void ADDI2R_internal(ARM64Reg Rd, ARM64Reg Rn, u64 imm, bool negative, bool flags,
+                       ARM64Reg scratch);
   void ADDI2R(ARM64Reg Rd, ARM64Reg Rn, u64 imm, ARM64Reg scratch = INVALID_REG);
+  void ADDSI2R(ARM64Reg Rd, ARM64Reg Rn, u64 imm, ARM64Reg scratch = INVALID_REG);
   void SUBI2R(ARM64Reg Rd, ARM64Reg Rn, u64 imm, ARM64Reg scratch = INVALID_REG);
   void SUBSI2R(ARM64Reg Rd, ARM64Reg Rn, u64 imm, ARM64Reg scratch = INVALID_REG);
 
@@ -981,6 +983,7 @@ public:
   void FDIV(u8 size, ARM64Reg Rd, ARM64Reg Rn, ARM64Reg Rm);
   void FMUL(u8 size, ARM64Reg Rd, ARM64Reg Rn, ARM64Reg Rm);
   void FNEG(u8 size, ARM64Reg Rd, ARM64Reg Rn);
+  void FRECPE(u8 size, ARM64Reg Rd, ARM64Reg Rn);
   void FRSQRTE(u8 size, ARM64Reg Rd, ARM64Reg Rn);
   void FSUB(u8 size, ARM64Reg Rd, ARM64Reg Rn, ARM64Reg Rm);
   void NOT(ARM64Reg Rd, ARM64Reg Rn);
@@ -1123,19 +1126,21 @@ private:
   void UXTL(u8 src_size, ARM64Reg Rd, ARM64Reg Rn, bool upper);
 };
 
-class ARM64CodeBlock : public CodeBlock<ARM64XEmitter>
+class ARM64CodeBlock : public Common::CodeBlock<ARM64XEmitter>
 {
 private:
   void PoisonMemory() override
   {
-    u32* ptr = (u32*)region;
-    u32* maxptr = (u32*)(region + region_size);
     // If our memory isn't a multiple of u32 then this won't write the last remaining bytes with
     // anything
     // Less than optimal, but there would be nothing we could do but throw a runtime warning anyway.
     // AArch64: 0xD4200000 = BRK 0
-    while (ptr < maxptr)
-      *ptr++ = 0xD4200000;
+    constexpr u32 brk_0 = 0xD4200000;
+
+    for (size_t i = 0; i < region_size; i += sizeof(u32))
+    {
+      std::memcpy(region + i, &brk_0, sizeof(u32));
+    }
   }
 };
 }

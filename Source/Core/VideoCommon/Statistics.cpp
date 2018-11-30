@@ -30,7 +30,7 @@ std::string Statistics::ToString()
 {
   std::string str;
 
-  if (g_ActiveConfig.backend_info.APIType == API_TYPE::API_NONE)
+  if (g_ActiveConfig.backend_info.api_type == APIType::Nothing)
   {
     str += StringFromFormat("Objects:            %i\n", stats.thisFrame.numDrawnObjects);
     str += StringFromFormat("Vertices Loaded:    %i\n", stats.thisFrame.numVerticesLoaded);
@@ -68,8 +68,7 @@ std::string Statistics::ToString()
   str += StringFromFormat("Uniform streamed: %i kB\n", stats.thisFrame.bytesUniformStreamed / 1024);
   str += StringFromFormat("Vertex Loaders: %i\n", stats.numVertexLoaders);
 
-  std::string vertex_list;
-  VertexLoaderManager::AppendListToString(&vertex_list);
+  std::string vertex_list = VertexLoaderManager::VertexLoadersToString();
 
   // TODO : at some point text1 just becomes too huge and overflows, we can't even read the added
   // stuff

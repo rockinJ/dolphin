@@ -2,6 +2,8 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include <cinttypes>
+#include <cstddef>
 #include <string>
 
 #include "Common/BitSet.h"
@@ -9,15 +11,17 @@
 #include "Common/CommonTypes.h"
 #include "Common/Logging/Log.h"
 #include "Common/StringUtil.h"
+#include "Common/Swap.h"
 
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/JitArm64/Jit.h"
 #include "Core/PowerPC/JitArmCommon/BackPatch.h"
+#include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 
 using namespace Arm64Gen;
 
-static void DoBacktrace(uintptr_t access_address, SContext* ctx)
+void JitArm64::DoBacktrace(uintptr_t access_address, SContext* ctx)
 {
   for (int i = 0; i < 30; i += 2)
     ERROR_LOG(DYNA_REC, "R%d: 0x%016llx\tR%d: 0x%016llx", i, ctx->CTX_REG(i), i + 1,
@@ -37,7 +41,7 @@ static void DoBacktrace(uintptr_t access_address, SContext* ctx)
                                   Common::swap32(*(u32*)(pc + 4)), Common::swap32(*(u32*)(pc + 8)),
                                   Common::swap32(*(u32*)(pc + 12)));
 
-    ERROR_LOG(DYNA_REC, "0x%016lx: %08x %08x %08x %08x", pc, *(u32*)pc, *(u32*)(pc + 4),
+    ERROR_LOG(DYNA_REC, "0x%016" PRIx64 ": %08x %08x %08x %08x", pc, *(u32*)pc, *(u32*)(pc + 4),
               *(u32*)(pc + 8), *(u32*)(pc + 12));
   }
 
@@ -181,33 +185,33 @@ void JitArm64::EmitBackpatchRoutine(u32 flags, bool fastmem, bool do_farcode, AR
       {
         m_float_emit.FCVT(32, 64, D0, RS);
         m_float_emit.UMOV(32, W0, Q0, 0);
-        MOVI2R(X30, (u64)&PowerPC::Write_U32);
+        MOVP2R(X30, &PowerPC::Write_U32);
         BLR(X30);
       }
       else if (flags & BackPatchInfo::FLAG_SIZE_F32I)
       {
         m_float_emit.UMOV(32, W0, RS, 0);
-        MOVI2R(X30, (u64)&PowerPC::Write_U32);
+        MOVP2R(X30, &PowerPC::Write_U32);
         BLR(X30);
       }
       else if (flags & BackPatchInfo::FLAG_SIZE_F32X2)
       {
         m_float_emit.FCVTN(32, D0, RS);
         m_float_emit.UMOV(64, X0, D0, 0);
-        ORR(X0, SP, X0, ArithOption(X0, ST_ROR, 32));
-        MOVI2R(X30, (u64)PowerPC::Write_U64);
+        ROR(X0, X0, 32);
+        MOVP2R(X30, &PowerPC::Write_U64);
         BLR(X30);
       }
       else if (flags & BackPatchInfo::FLAG_SIZE_F32X2I)
       {
         m_float_emit.UMOV(64, X0, RS, 0);
-        ORR(X0, SP, X0, ArithOption(X0, ST_ROR, 32));
-        MOVI2R(X30, (u64)PowerPC::Write_U64);
+        ROR(X0, X0, 32);
+        MOVP2R(X30, &PowerPC::Write_U64);
         BLR(X30);
       }
       else
       {
-        MOVI2R(X30, (u64)&PowerPC::Write_U64);
+        MOVP2R(X30, &PowerPC::Write_U64);
         m_float_emit.UMOV(64, X0, RS, 0);
         BLR(X30);
       }
@@ -216,13 +220,13 @@ void JitArm64::EmitBackpatchRoutine(u32 flags, bool fastmem, bool do_farcode, AR
     {
       if (flags & BackPatchInfo::FLAG_SIZE_F32)
       {
-        MOVI2R(X30, (u64)&PowerPC::Read_U32);
+        MOVP2R(X30, &PowerPC::Read_U32);
         BLR(X30);
         m_float_emit.INS(32, RS, 0, X0);
       }
       else
       {
-        MOVI2R(X30, (u64)&PowerPC::Read_F64);
+        MOVP2R(X30, &PowerPC::Read_F64);
         BLR(X30);
         m_float_emit.INS(64, RS, 0, X0);
       }
@@ -232,27 +236,27 @@ void JitArm64::EmitBackpatchRoutine(u32 flags, bool fastmem, bool do_farcode, AR
       MOV(W0, RS);
 
       if (flags & BackPatchInfo::FLAG_SIZE_32)
-        MOVI2R(X30, (u64)&PowerPC::Write_U32);
+        MOVP2R(X30, &PowerPC::Write_U32);
       else if (flags & BackPatchInfo::FLAG_SIZE_16)
-        MOVI2R(X30, (u64)&PowerPC::Write_U16);
+        MOVP2R(X30, &PowerPC::Write_U16);
       else
-        MOVI2R(X30, (u64)&PowerPC::Write_U8);
+        MOVP2R(X30, &PowerPC::Write_U8);
 
       BLR(X30);
     }
     else if (flags & BackPatchInfo::FLAG_ZERO_256)
     {
-      MOVI2R(X30, (u64)&PowerPC::ClearCacheLine);
+      MOVP2R(X30, &PowerPC::ClearCacheLine);
       BLR(X30);
     }
     else
     {
       if (flags & BackPatchInfo::FLAG_SIZE_32)
-        MOVI2R(X30, (u64)&PowerPC::Read_U32);
+        MOVP2R(X30, &PowerPC::Read_U32);
       else if (flags & BackPatchInfo::FLAG_SIZE_16)
-        MOVI2R(X30, (u64)&PowerPC::Read_U16);
+        MOVP2R(X30, &PowerPC::Read_U16);
       else if (flags & BackPatchInfo::FLAG_SIZE_8)
-        MOVI2R(X30, (u64)&PowerPC::Read_U8);
+        MOVP2R(X30, &PowerPC::Read_U8);
 
       BLR(X30);
 
@@ -283,17 +287,8 @@ void JitArm64::EmitBackpatchRoutine(u32 flags, bool fastmem, bool do_farcode, AR
   }
 }
 
-bool JitArm64::HandleFault(uintptr_t access_address, SContext* ctx)
+bool JitArm64::HandleFastmemFault(uintptr_t access_address, SContext* ctx)
 {
-  if (!IsInSpace((u8*)ctx->CTX_PC))
-  {
-    ERROR_LOG(DYNA_REC, "Backpatch location not within codespace 0x%016llx(0x%08x)", ctx->CTX_PC,
-              Common::swap32(*(u32*)ctx->CTX_PC));
-
-    DoBacktrace(access_address, ctx);
-    return false;
-  }
-
   if (!(access_address >= (uintptr_t)Memory::physical_base &&
         access_address < (uintptr_t)Memory::physical_base + 0x100010000) &&
       !(access_address >= (uintptr_t)Memory::logical_base &&
@@ -302,8 +297,6 @@ bool JitArm64::HandleFault(uintptr_t access_address, SContext* ctx)
     ERROR_LOG(DYNA_REC,
               "Exception handler - access below memory space. PC: 0x%016llx 0x%016lx < 0x%016lx",
               ctx->CTX_PC, access_address, (uintptr_t)Memory::physical_base);
-
-    DoBacktrace(access_address, ctx);
     return false;
   }
 
@@ -314,21 +307,24 @@ bool JitArm64::HandleFault(uintptr_t access_address, SContext* ctx)
   if (slow_handler_iter == m_fault_to_handler.end())
     return false;
 
+  const u8* fault_location = slow_handler_iter->first;
+  const u32 fastmem_area_length = slow_handler_iter->second.length;
+
   // no overlapping fastmem area found
-  if ((const u8*)ctx->CTX_PC - slow_handler_iter->first > slow_handler_iter->second.length)
+  if ((const u8*)ctx->CTX_PC - fault_location > fastmem_area_length)
     return false;
 
-  ARM64XEmitter emitter((u8*)slow_handler_iter->first);
+  ARM64XEmitter emitter((u8*)fault_location);
 
   emitter.BL(slow_handler_iter->second.slowmem_code);
 
-  u32 num_insts_max = slow_handler_iter->second.length / 4 - 1;
+  const u32 num_insts_max = fastmem_area_length / 4 - 1;
   for (u32 i = 0; i < num_insts_max; ++i)
     emitter.HINT(HINT_NOP);
 
   m_fault_to_handler.erase(slow_handler_iter);
 
   emitter.FlushIcache();
-  ctx->CTX_PC = (u64)slow_handler_iter->first;
+  ctx->CTX_PC = reinterpret_cast<std::uintptr_t>(fault_location);
   return true;
 }

@@ -22,7 +22,7 @@ namespace Pipes
 // SET {L, R} [0, 1]
 // SET {MAIN, C} [0, 1] [0, 1]
 
-void Init();
+void PopulateDevices();
 
 class PipeDevice : public Core::Device
 {
@@ -33,6 +33,7 @@ public:
   void UpdateInput() override;
   std::string GetName() const override { return m_name; }
   std::string GetSource() const override { return "Pipe"; }
+
 private:
   class PipeInput : public Input
   {
@@ -41,6 +42,7 @@ private:
     std::string GetName() const override { return m_name; }
     ControlState GetState() const override { return m_state; }
     void SetState(ControlState state) { m_state = state; }
+
   private:
     const std::string m_name;
     ControlState m_state;

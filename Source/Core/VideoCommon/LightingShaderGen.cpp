@@ -2,7 +2,14 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
-#include <VideoCommon/LightingShaderGen.h>
+#include "VideoCommon/LightingShaderGen.h"
+
+#include "Common/Assert.h"
+#include "Common/CommonTypes.h"
+
+#include "VideoCommon/NativeVertexFormat.h"
+#include "VideoCommon/ShaderGenCommon.h"
+#include "VideoCommon/XFMemory.h"
 
 static void GenerateLightShader(ShaderCode& object, const LightingUidData& uid_data, int index,
                                 int litchan_index, bool alpha)
@@ -60,7 +67,7 @@ static void GenerateLightShader(ShaderCode& object, const LightingUidData& uid_d
                  swizzle_components, LIGHT_COL_PARAMS(index, swizzle));
     break;
   default:
-    _assert_(0);
+    ASSERT(0);
   }
 
   object.Write("\n");
@@ -74,7 +81,7 @@ static void GenerateLightShader(ShaderCode& object, const LightingUidData& uid_d
 void GenerateLightingShaderCode(ShaderCode& object, const LightingUidData& uid_data, int components,
                                 const char* inColorName, const char* dest)
 {
-  for (unsigned int j = 0; j < xfmem.numChan.numColorChans; j++)
+  for (unsigned int j = 0; j < NUM_XF_COLOR_CHANNELS; j++)
   {
     object.Write("{\n");
 
@@ -178,7 +185,7 @@ void GenerateLightingShaderCode(ShaderCode& object, const LightingUidData& uid_d
 
 void GetLightingShaderUid(LightingUidData& uid_data)
 {
-  for (unsigned int j = 0; j < xfmem.numChan.numColorChans; j++)
+  for (unsigned int j = 0; j < NUM_XF_COLOR_CHANNELS; j++)
   {
     uid_data.matsource |= xfmem.color[j].matsource << j;
     uid_data.matsource |= xfmem.alpha[j].matsource << (j + 2);

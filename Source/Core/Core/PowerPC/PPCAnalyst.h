@@ -5,9 +5,8 @@
 #pragma once
 
 #include <algorithm>
-#include <cstdlib>
-#include <map>
-#include <string>
+#include <cstddef>
+#include <set>
 #include <vector>
 
 #include "Common/BitSet.h"
@@ -15,7 +14,11 @@
 #include "Core/PowerPC/PPCTables.h"
 
 class PPCSymbolDB;
+
+namespace Common
+{
 struct Symbol;
+}
 
 namespace PPCAnalyst
 {
@@ -41,6 +44,7 @@ struct CodeOp  // 16B
   bool outputFPRF;
   bool outputCA;
   bool canEndBlock;
+  bool skipLRStack;
   bool skip;  // followed BL-s for example
   // which registers are still needed after this instruction in this block
   BitSet32 fprInUse;
@@ -115,18 +119,7 @@ struct BlockRegStats
   }
 };
 
-class CodeBuffer
-{
-public:
-  CodeBuffer(int size);
-  ~CodeBuffer();
-
-  int GetSize() const { return size_; }
-  PPCAnalyst::CodeOp* codebuffer;
-
-private:
-  int size_;
-};
+using CodeBuffer = std::vector<CodeOp>;
 
 struct CodeBlock
 {
@@ -154,25 +147,16 @@ struct CodeBlock
 
   // Which GQRs this block modifies, if any.
   BitSet8 m_gqr_modified;
+
+  // Which GPRs this block reads from before defining, if any.
+  BitSet32 m_gpr_inputs;
+
+  // Which memory locations are occupied by this block.
+  std::set<u32> m_physical_addresses;
 };
 
 class PPCAnalyzer
 {
-private:
-  enum ReorderType
-  {
-    REORDER_CARRY,
-    REORDER_CMP,
-    REORDER_CROR
-  };
-
-  void ReorderInstructionsCore(u32 instructions, CodeOp* code, bool reverse, ReorderType type);
-  void ReorderInstructions(u32 instructions, CodeOp* code);
-  void SetInstructionStats(CodeBlock* block, CodeOp* code, GekkoOPInfo* opinfo, u32 index);
-
-  // Options
-  u32 m_options;
-
 public:
   enum AnalystOption
   {
@@ -182,11 +166,11 @@ public:
     // Requires JIT support to be enabled.
     OPTION_CONDITIONAL_CONTINUE = (1 << 0),
 
-    // If there is a unconditional branch that jumps to a leaf function then inline it.
+    // Try to inline unconditional branches/calls/returns.
+    // Also track the LR value to follow unconditional return instructions.
     // Might require JIT intervention to support it correctly.
-    // Requires JITBLock support for inlined code
-    // XXX: NOT COMPLETE
-    OPTION_LEAF_INLINE = (1 << 1),
+    // Especially if the BLR optimization is used.
+    OPTION_BRANCH_FOLLOW = (1 << 1),
 
     // Complex blocks support jumping backwards on to themselves.
     // Happens commonly in loops, pretty complex to support.
@@ -212,16 +196,31 @@ public:
     OPTION_CROR_MERGE = (1 << 6),
   };
 
-  PPCAnalyzer() : m_options(0) {}
   // Option setting/getting
   void SetOption(AnalystOption option) { m_options |= option; }
   void ClearOption(AnalystOption option) { m_options &= ~(option); }
   bool HasOption(AnalystOption option) const { return !!(m_options & option); }
-  u32 Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer, u32 blockSize);
+  u32 Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer, std::size_t block_size);
+
+private:
+  enum class ReorderType
+  {
+    Carry,
+    CMP,
+    CROR
+  };
+
+  void ReorderInstructionsCore(u32 instructions, CodeOp* code, bool reverse, ReorderType type);
+  void ReorderInstructions(u32 instructions, CodeOp* code);
+  void SetInstructionStats(CodeBlock* block, CodeOp* code, const GekkoOPInfo* opinfo, u32 index);
+
+  // Options
+  u32 m_options = 0;
 };
 
 void LogFunctionCall(u32 addr);
 void FindFunctions(u32 startAddr, u32 endAddr, PPCSymbolDB* func_db);
-bool AnalyzeFunction(u32 startAddr, Symbol& func, int max_size = 0);
+bool AnalyzeFunction(u32 startAddr, Common::Symbol& func, u32 max_size = 0);
+bool ReanalyzeFunction(u32 start_addr, Common::Symbol& func, u32 max_size = 0);
 
 }  // namespace

@@ -5,28 +5,47 @@
 #pragma once
 
 #include <string>
-#include "Common/ChunkFile.h"
+
+#include "Common/CommonTypes.h"
 #include "Core/MachineContext.h"
-#include "Core/PowerPC/CPUCoreBase.h"
-#include "Core/PowerPC/Profiler.h"
+
+class CPUCoreBase;
+class PointerWrap;
+
+namespace PowerPC
+{
+enum class CPUCore;
+}
+
+namespace Profiler
+{
+struct ProfileStats;
+}
 
 namespace JitInterface
 {
 enum class ExceptionType
 {
-  EXCEPTIONS_FIFO_WRITE,
-  EXCEPTIONS_PAIRED_QUANTIZE
+  FIFOWrite,
+  PairedQuantize,
+  SpeculativeConstants
 };
 
 void DoState(PointerWrap& p);
 
-CPUCoreBase* InitJitCore(int core);
-void InitTables(int core);
+CPUCoreBase* InitJitCore(PowerPC::CPUCore core);
 CPUCoreBase* GetCore();
 
 // Debugging
+enum class ProfilingState
+{
+  Enabled,
+  Disabled
+};
+
+void SetProfilingState(ProfilingState state);
 void WriteProfileResults(const std::string& filename);
-void GetProfileResults(ProfileStats* prof_stats);
+void GetProfileResults(Profiler::ProfileStats* prof_stats);
 int GetHostCode(u32* address, const u8** code, u32* code_size);
 
 // Memory Utilities
@@ -36,6 +55,9 @@ bool HandleStackFault();
 // Clearing CodeCache
 void ClearCache();
 
+// This clear is "safe" in the sense that it's okay to run from
+// inside a JIT'ed block: it clears the instruction cache, but not
+// the JIT'ed code.
 void ClearSafe();
 
 // If "forced" is true, a recompile is being requested on code that hasn't been modified.

@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <array>
 #include <jni.h>
 #include <mutex>
 
@@ -13,14 +14,13 @@
 #include "Core/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
-#include "Core/HW/SI.h"
+#include "Core/HW/SI/SI.h"
 #include "Core/HW/SystemTimers.h"
 
 #include "InputCommon/GCAdapter.h"
 #include "InputCommon/GCPadStatus.h"
 
-// Global java_vm class
-extern JavaVM* g_java_vm;
+#include "jni/AndroidCommon/IDCache.h"
 
 namespace GCAdapter
 {
@@ -32,14 +32,14 @@ static jclass s_adapter_class;
 
 static bool s_detected = false;
 static int s_fd = 0;
-static u8 s_controller_type[MAX_SI_CHANNELS] = {
+static u8 s_controller_type[SerialInterface::MAX_SI_CHANNELS] = {
     ControllerTypes::CONTROLLER_NONE, ControllerTypes::CONTROLLER_NONE,
     ControllerTypes::CONTROLLER_NONE, ControllerTypes::CONTROLLER_NONE};
 static u8 s_controller_rumble[4];
 
 // Input handling
 static std::mutex s_read_mutex;
-static u8 s_controller_payload[37];
+static std::array<u8, 37> s_controller_payload;
 static std::atomic<int> s_controller_payload_size{0};
 
 // Output handling
@@ -66,7 +66,7 @@ static void ScanThreadFunc()
   NOTICE_LOG(SERIALINTERFACE, "GC Adapter scanning thread started");
 
   JNIEnv* env;
-  g_java_vm->AttachCurrentThread(&env, NULL);
+  IDCache::GetJavaVM()->AttachCurrentThread(&env, NULL);
 
   jmethodID queryadapter_func = env->GetStaticMethodID(s_adapter_class, "QueryAdapter", "()Z");
 
@@ -77,7 +77,7 @@ static void ScanThreadFunc()
       Setup();
     Common::SleepCurrentThread(1000);
   }
-  g_java_vm->DetachCurrentThread();
+  IDCache::GetJavaVM()->DetachCurrentThread();
 
   NOTICE_LOG(SERIALINTERFACE, "GC Adapter scanning thread stopped");
 }
@@ -88,7 +88,7 @@ static void Write()
   NOTICE_LOG(SERIALINTERFACE, "GC Adapter write thread started");
 
   JNIEnv* env;
-  g_java_vm->AttachCurrentThread(&env, NULL);
+  IDCache::GetJavaVM()->AttachCurrentThread(&env, NULL);
   jmethodID output_func = env->GetStaticMethodID(s_adapter_class, "Output", "([B)I");
 
   while (s_write_adapter_thread_running.IsSet())
@@ -118,7 +118,7 @@ static void Write()
     Common::YieldCPU();
   }
 
-  g_java_vm->DetachCurrentThread();
+  IDCache::GetJavaVM()->DetachCurrentThread();
 
   NOTICE_LOG(SERIALINTERFACE, "GC Adapter write thread stopped");
 }
@@ -130,7 +130,7 @@ static void Read()
 
   bool first_read = true;
   JNIEnv* env;
-  g_java_vm->AttachCurrentThread(&env, NULL);
+  IDCache::GetJavaVM()->AttachCurrentThread(&env, NULL);
 
   jfieldID payload_field = env->GetStaticFieldID(s_adapter_class, "controller_payload", "[B");
   jobject payload_object = env->GetStaticObjectField(s_adapter_class, payload_field);
@@ -158,7 +158,7 @@ static void Read()
       jbyte* java_data = env->GetByteArrayElements(*java_controller_payload, nullptr);
       {
         std::lock_guard<std::mutex> lk(s_read_mutex);
-        memcpy(s_controller_payload, java_data, 0x37);
+        std::copy(java_data, java_data + s_controller_payload.size(), s_controller_payload.begin());
         s_controller_payload_size.store(read_size);
       }
       env->ReleaseByteArrayElements(*java_controller_payload, java_data, 0);
@@ -184,7 +184,7 @@ static void Read()
   s_fd = 0;
   s_detected = false;
 
-  g_java_vm->DetachCurrentThread();
+  IDCache::GetJavaVM()->DetachCurrentThread();
 
   NOTICE_LOG(SERIALINTERFACE, "GC Adapter read thread stopped");
 }
@@ -194,7 +194,7 @@ void Init()
   if (s_fd)
     return;
 
-  if (Core::GetState() != Core::CORE_UNINITIALIZED)
+  if (Core::GetState() != Core::State::Uninitialized && Core::GetState() != Core::State::Starting)
   {
     if ((CoreTiming::GetTicks() - s_last_init) < SystemTimers::GetTicksPerSecond())
       return;
@@ -203,7 +203,7 @@ void Init()
   }
 
   JNIEnv* env;
-  g_java_vm->AttachCurrentThread(&env, NULL);
+  IDCache::GetJavaVM()->AttachCurrentThread(&env, NULL);
 
   jclass adapter_class = env->FindClass("org/dolphinemu/dolphinemu/utils/Java_GCAdapter");
   s_adapter_class = reinterpret_cast<jclass>(env->NewGlobalRef(adapter_class));
@@ -233,7 +233,7 @@ static void Reset()
   if (s_read_adapter_thread_running.TestAndClear())
     s_read_adapter_thread.join();
 
-  for (int i = 0; i < MAX_SI_CHANNELS; i++)
+  for (int i = 0; i < SerialInterface::MAX_SI_CHANNELS; i++)
     s_controller_type[i] = ControllerTypes::CONTROLLER_NONE;
 
   s_detected = false;
@@ -262,22 +262,22 @@ void StopScanThread()
     s_adapter_detect_thread.join();
 }
 
-void Input(int chan, GCPadStatus* pad)
+GCPadStatus Input(int chan)
 {
   if (!UseAdapter() || !s_detected || !s_fd)
-    return;
+    return {};
 
   int payload_size = 0;
-  u8 controller_payload_copy[37];
+  std::array<u8, 37> controller_payload_copy;
 
   {
     std::lock_guard<std::mutex> lk(s_read_mutex);
-    std::copy(std::begin(s_controller_payload), std::end(s_controller_payload),
-              std::begin(controller_payload_copy));
+    controller_payload_copy = s_controller_payload;
     payload_size = s_controller_payload_size.load();
   }
 
-  if (payload_size != sizeof(controller_payload_copy))
+  GCPadStatus pad = {};
+  if (payload_size != controller_payload_copy.size())
   {
     ERROR_LOG(SERIALINTERFACE, "error reading payload (size: %d, type: %02x)", payload_size,
               controller_payload_copy[0]);
@@ -297,54 +297,55 @@ void Input(int chan, GCPadStatus* pad)
 
     s_controller_type[chan] = type;
 
-    memset(pad, 0, sizeof(*pad));
     if (s_controller_type[chan] != ControllerTypes::CONTROLLER_NONE)
     {
       u8 b1 = controller_payload_copy[1 + (9 * chan) + 1];
       u8 b2 = controller_payload_copy[1 + (9 * chan) + 2];
 
       if (b1 & (1 << 0))
-        pad->button |= PAD_BUTTON_A;
+        pad.button |= PAD_BUTTON_A;
       if (b1 & (1 << 1))
-        pad->button |= PAD_BUTTON_B;
+        pad.button |= PAD_BUTTON_B;
       if (b1 & (1 << 2))
-        pad->button |= PAD_BUTTON_X;
+        pad.button |= PAD_BUTTON_X;
       if (b1 & (1 << 3))
-        pad->button |= PAD_BUTTON_Y;
+        pad.button |= PAD_BUTTON_Y;
 
       if (b1 & (1 << 4))
-        pad->button |= PAD_BUTTON_LEFT;
+        pad.button |= PAD_BUTTON_LEFT;
       if (b1 & (1 << 5))
-        pad->button |= PAD_BUTTON_RIGHT;
+        pad.button |= PAD_BUTTON_RIGHT;
       if (b1 & (1 << 6))
-        pad->button |= PAD_BUTTON_DOWN;
+        pad.button |= PAD_BUTTON_DOWN;
       if (b1 & (1 << 7))
-        pad->button |= PAD_BUTTON_UP;
+        pad.button |= PAD_BUTTON_UP;
 
       if (b2 & (1 << 0))
-        pad->button |= PAD_BUTTON_START;
+        pad.button |= PAD_BUTTON_START;
       if (b2 & (1 << 1))
-        pad->button |= PAD_TRIGGER_Z;
+        pad.button |= PAD_TRIGGER_Z;
       if (b2 & (1 << 2))
-        pad->button |= PAD_TRIGGER_R;
+        pad.button |= PAD_TRIGGER_R;
       if (b2 & (1 << 3))
-        pad->button |= PAD_TRIGGER_L;
+        pad.button |= PAD_TRIGGER_L;
 
       if (get_origin)
-        pad->button |= PAD_GET_ORIGIN;
+        pad.button |= PAD_GET_ORIGIN;
 
-      pad->stickX = controller_payload_copy[1 + (9 * chan) + 3];
-      pad->stickY = controller_payload_copy[1 + (9 * chan) + 4];
-      pad->substickX = controller_payload_copy[1 + (9 * chan) + 5];
-      pad->substickY = controller_payload_copy[1 + (9 * chan) + 6];
-      pad->triggerLeft = controller_payload_copy[1 + (9 * chan) + 7];
-      pad->triggerRight = controller_payload_copy[1 + (9 * chan) + 8];
+      pad.stickX = controller_payload_copy[1 + (9 * chan) + 3];
+      pad.stickY = controller_payload_copy[1 + (9 * chan) + 4];
+      pad.substickX = controller_payload_copy[1 + (9 * chan) + 5];
+      pad.substickY = controller_payload_copy[1 + (9 * chan) + 6];
+      pad.triggerLeft = controller_payload_copy[1 + (9 * chan) + 7];
+      pad.triggerRight = controller_payload_copy[1 + (9 * chan) + 8];
     }
     else
     {
-      pad->button = PAD_ERR_STATUS;
+      pad.button = PAD_ERR_STATUS;
     }
   }
+
+  return pad;
 }
 
 void Output(int chan, u8 rumble_command)
@@ -383,10 +384,11 @@ bool DeviceConnected(int chan)
 
 bool UseAdapter()
 {
-  return SConfig::GetInstance().m_SIDevice[0] == SIDEVICE_WIIU_ADAPTER ||
-         SConfig::GetInstance().m_SIDevice[1] == SIDEVICE_WIIU_ADAPTER ||
-         SConfig::GetInstance().m_SIDevice[2] == SIDEVICE_WIIU_ADAPTER ||
-         SConfig::GetInstance().m_SIDevice[3] == SIDEVICE_WIIU_ADAPTER;
+  const auto& si_devices = SConfig::GetInstance().m_SIDevice;
+
+  return std::any_of(std::begin(si_devices), std::end(si_devices), [](const auto device_type) {
+    return device_type == SerialInterface::SIDEVICE_WIIU_ADAPTER;
+  });
 }
 
 void ResetRumble()

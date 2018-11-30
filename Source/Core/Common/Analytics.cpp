@@ -4,12 +4,13 @@
 
 #include <cmath>
 #include <cstdio>
-#include <curl/curl.h>
 #include <string>
+#include <type_traits>
 
 #include "Common/Analytics.h"
 #include "Common/CommonTypes.h"
 #include "Common/StringUtil.h"
+#include "Common/Thread.h"
 
 namespace Common
 {
@@ -17,7 +18,7 @@ namespace
 {
 // Format version number, used as the first byte of every report sent.
 // Increment for any change to the wire format.
-constexpr u8 WIRE_FORMAT_VERSION = 0;
+constexpr u8 WIRE_FORMAT_VERSION = 1;
 
 // Identifiers for the value types supported by the analytics reporting wire
 // format.
@@ -28,7 +29,16 @@ enum class TypeId : u8
   UINT = 2,
   SINT = 3,
   FLOAT = 4,
+
+  // Flags which can be combined with other types.
+  ARRAY = 0x80,
 };
+
+TypeId operator|(TypeId l, TypeId r)
+{
+  using ut = std::underlying_type_t<TypeId>;
+  return static_cast<TypeId>(static_cast<ut>(l) | static_cast<ut>(r));
+}
 
 void AppendBool(std::string* out, bool v)
 {
@@ -59,13 +69,6 @@ void AppendType(std::string* out, TypeId type)
 {
   out->push_back(static_cast<u8>(type));
 }
-
-// Dummy write function for curl.
-size_t DummyCurlWriteFunction(char* ptr, size_t size, size_t nmemb, void* userdata)
-{
-  return size * nmemb;
-}
-
 }  // namespace
 
 AnalyticsReportBuilder::AnalyticsReportBuilder()
@@ -119,6 +122,15 @@ void AnalyticsReportBuilder::AppendSerializedValue(std::string* report, float v)
   AppendBytes(report, reinterpret_cast<u8*>(&v), sizeof(v), false);
 }
 
+void AnalyticsReportBuilder::AppendSerializedValueVector(std::string* report,
+                                                         const std::vector<u32>& v)
+{
+  AppendType(report, TypeId::UINT | TypeId::ARRAY);
+  AppendVarInt(report, v.size());
+  for (u32 x : v)
+    AppendVarInt(report, x);
+}
+
 AnalyticsReporter::AnalyticsReporter()
 {
   m_reporter_thread = std::thread(&AnalyticsReporter::ThreadProc, this);
@@ -134,6 +146,7 @@ AnalyticsReporter::~AnalyticsReporter()
 
 void AnalyticsReporter::Send(AnalyticsReportBuilder&& report)
 {
+#if defined(USE_ANALYTICS) && USE_ANALYTICS
   // Put a bound on the size of the queue to avoid uncontrolled memory growth.
   constexpr u32 QUEUE_SIZE_LIMIT = 25;
   if (m_reports_queue.Size() < QUEUE_SIZE_LIMIT)
@@ -141,10 +154,12 @@ void AnalyticsReporter::Send(AnalyticsReportBuilder&& report)
     m_reports_queue.Push(report.Consume());
     m_reporter_event.Set();
   }
+#endif
 }
 
 void AnalyticsReporter::ThreadProc()
 {
+  Common::SetCurrentThreadName("Analytics");
   while (true)
   {
     m_reporter_event.Wait();
@@ -183,41 +198,15 @@ void StdoutAnalyticsBackend::Send(std::string report)
          HexDump(reinterpret_cast<const u8*>(report.data()), report.size()).c_str());
 }
 
-HttpAnalyticsBackend::HttpAnalyticsBackend(const std::string& endpoint)
+HttpAnalyticsBackend::HttpAnalyticsBackend(const std::string& endpoint) : m_endpoint(endpoint)
 {
-  CURL* curl = curl_easy_init();
-  if (curl)
-  {
-    curl_easy_setopt(curl, CURLOPT_URL, endpoint.c_str());
-    curl_easy_setopt(curl, CURLOPT_POST, true);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &DummyCurlWriteFunction);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 3000);
-
-#ifdef _WIN32
-    // ALPN support is enabled by default but requires Windows >= 8.1.
-    curl_easy_setopt(curl, CURLOPT_SSL_ENABLE_ALPN, false);
-#endif
-
-    m_curl = curl;
-  }
 }
 
-HttpAnalyticsBackend::~HttpAnalyticsBackend()
-{
-  if (m_curl)
-  {
-    curl_easy_cleanup(m_curl);
-  }
-}
+HttpAnalyticsBackend::~HttpAnalyticsBackend() = default;
 
 void HttpAnalyticsBackend::Send(std::string report)
 {
-  if (!m_curl)
-    return;
-
-  curl_easy_setopt(m_curl, CURLOPT_POSTFIELDS, report.c_str());
-  curl_easy_setopt(m_curl, CURLOPT_POSTFIELDSIZE, report.size());
-  curl_easy_perform(m_curl);
+  if (m_http.IsValid())
+    m_http.Post(m_endpoint, report);
 }
-
 }  // namespace Common

@@ -2,11 +2,14 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include "VideoBackends/OGL/StreamBuffer.h"
+
+#include "Common/Align.h"
 #include "Common/GL/GLUtil.h"
+#include "Common/MathUtil.h"
 #include "Common/MemoryUtil.h"
 
 #include "VideoBackends/OGL/Render.h"
-#include "VideoBackends/OGL/StreamBuffer.h"
 
 #include "VideoCommon/DriverDetails.h"
 #include "VideoCommon/OnScreenDisplay.h"
@@ -22,8 +25,8 @@ static u32 GenBuffer()
 }
 
 StreamBuffer::StreamBuffer(u32 type, u32 size)
-    : m_buffer(GenBuffer()), m_buffertype(type), m_size(ROUND_UP_POW2(size)),
-      m_bit_per_slot(IntLog2(ROUND_UP_POW2(size) / SYNC_POINTS))
+    : m_buffer(GenBuffer()), m_buffertype(type), m_size(MathUtil::NextPowerOf2(size)),
+      m_bit_per_slot(IntLog2(MathUtil::NextPowerOf2(size) / SYNC_POINTS))
 {
   m_iterator = 0;
   m_used_iterator = 0;
@@ -94,7 +97,13 @@ void StreamBuffer::AllocMemory(u32 size)
     glClientWaitSync(m_fences[i], GL_SYNC_FLUSH_COMMANDS_BIT, GL_TIMEOUT_IGNORED);
     glDeleteSync(m_fences[i]);
   }
-  m_free_iterator = m_iterator + size;
+
+  // If we allocate a large amount of memory (A), commit a smaller amount, then allocate memory
+  // smaller than allocation A, we will have already waited for these fences in A, but not used
+  // the space. In this case, don't set m_free_iterator to a position before that which we know
+  // is safe to use, which would result in waiting on the same fence(s) next time.
+  if ((m_iterator + size) > m_free_iterator)
+    m_free_iterator = m_iterator + size;
 
   // if buffer is full
   if (m_iterator + size >= m_size)
@@ -207,7 +216,7 @@ public:
 class BufferStorage : public StreamBuffer
 {
 public:
-  BufferStorage(u32 type, u32 size, bool _coherent = false)
+  BufferStorage(u32 type, u32 size, bool _coherent = true)
       : StreamBuffer(type, size), coherent(_coherent)
   {
     CreateFences();
@@ -217,11 +226,13 @@ public:
     // COHERENT_BIT is set so we don't have to use a MemoryBarrier on write
     // CLIENT_STORAGE_BIT is set since we access the buffer more frequently on the client side then
     // server side
-    glBufferStorage(m_buffertype, m_size, nullptr, GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT |
-                                                       (coherent ? GL_MAP_COHERENT_BIT : 0));
-    m_pointer = (u8*)glMapBufferRange(
-        m_buffertype, 0, m_size, GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT |
-                                     (coherent ? GL_MAP_COHERENT_BIT : GL_MAP_FLUSH_EXPLICIT_BIT));
+    glBufferStorage(m_buffertype, m_size, nullptr,
+                    GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT |
+                        (coherent ? GL_MAP_COHERENT_BIT : 0));
+    m_pointer =
+        (u8*)glMapBufferRange(m_buffertype, 0, m_size,
+                              GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT |
+                                  (coherent ? GL_MAP_COHERENT_BIT : GL_MAP_FLUSH_EXPLICIT_BIT));
   }
 
   ~BufferStorage()
@@ -261,11 +272,11 @@ public:
   PinnedMemory(u32 type, u32 size) : StreamBuffer(type, size)
   {
     CreateFences();
-    m_pointer =
-        (u8*)AllocateAlignedMemory(ROUND_UP(m_size, ALIGN_PINNED_MEMORY), ALIGN_PINNED_MEMORY);
+    m_pointer = static_cast<u8*>(Common::AllocateAlignedMemory(
+        Common::AlignUp(m_size, ALIGN_PINNED_MEMORY), ALIGN_PINNED_MEMORY));
     glBindBuffer(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, m_buffer);
-    glBufferData(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, ROUND_UP(m_size, ALIGN_PINNED_MEMORY),
-                 m_pointer, GL_STREAM_COPY);
+    glBufferData(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD,
+                 Common::AlignUp(m_size, ALIGN_PINNED_MEMORY), m_pointer, GL_STREAM_COPY);
     glBindBuffer(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, 0);
     glBindBuffer(m_buffertype, m_buffer);
   }
@@ -275,7 +286,7 @@ public:
     DeleteFences();
     glBindBuffer(m_buffertype, 0);
     glFinish();  // ogl pipeline must be flushed, else this buffer can be in use
-    FreeAlignedMemory(m_pointer);
+    Common::FreeAlignedMemory(m_pointer);
     m_pointer = nullptr;
   }
 
@@ -341,7 +352,7 @@ std::unique_ptr<StreamBuffer> StreamBuffer::Create(u32 type, u32 size)
   // without basevertex support, only streaming methods whith uploads everything to zero works fine:
   if (!g_ogl_config.bSupportsGLBaseVertex)
   {
-    if (!DriverDetails::HasBug(DriverDetails::BUG_BROKENBUFFERSTREAM))
+    if (!DriverDetails::HasBug(DriverDetails::BUG_BROKEN_BUFFER_STREAM))
       return std::make_unique<BufferSubData>(type, size);
 
     // BufferData is by far the worst way, only use it if needed
@@ -353,22 +364,25 @@ std::unique_ptr<StreamBuffer> StreamBuffer::Create(u32 type, u32 size)
   {
     // pinned memory is much faster than buffer storage on AMD cards
     if (g_ogl_config.bSupportsGLPinnedMemory &&
-        !(DriverDetails::HasBug(DriverDetails::BUG_BROKENPINNEDMEMORY) &&
-          type == GL_ELEMENT_ARRAY_BUFFER))
+        !(DriverDetails::HasBug(DriverDetails::BUG_BROKEN_PINNED_MEMORY)))
       return std::make_unique<PinnedMemory>(type, size);
 
     // buffer storage works well in most situations
-    bool coherent = DriverDetails::HasBug(DriverDetails::BUG_BROKENEXPLICITFLUSH);
     if (g_ogl_config.bSupportsGLBufferStorage &&
-        !(DriverDetails::HasBug(DriverDetails::BUG_BROKENBUFFERSTORAGE) &&
+        !(DriverDetails::HasBug(DriverDetails::BUG_BROKEN_BUFFER_STORAGE) &&
           type == GL_ARRAY_BUFFER) &&
-        !(DriverDetails::HasBug(DriverDetails::BUG_INTELBROKENBUFFERSTORAGE) &&
+        !(DriverDetails::HasBug(DriverDetails::BUG_INTEL_BROKEN_BUFFER_STORAGE) &&
           type == GL_ELEMENT_ARRAY_BUFFER))
-      return std::make_unique<BufferStorage>(type, size, coherent);
+      return std::make_unique<BufferStorage>(type, size);
 
     // don't fall back to MapAnd* for Nvidia drivers
-    if (DriverDetails::HasBug(DriverDetails::BUG_BROKENUNSYNCMAPPING))
-      return std::make_unique<BufferSubData>(type, size);
+    if (DriverDetails::HasBug(DriverDetails::BUG_BROKEN_UNSYNC_MAPPING))
+    {
+      if (DriverDetails::HasBug(DriverDetails::BUG_BROKEN_BUFFER_STREAM))
+        return std::make_unique<BufferData>(type, size);
+      else
+        return std::make_unique<BufferSubData>(type, size);
+    }
 
     // mapping fallback
     if (g_ogl_config.bSupportsGLSync)

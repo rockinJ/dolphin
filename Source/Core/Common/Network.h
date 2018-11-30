@@ -4,14 +4,18 @@
 
 #pragma once
 
+#include <array>
+#include <optional>
 #include <string>
 
 #include "Common/CommonTypes.h"
 
-enum MACConsumer
+namespace Common
 {
-  BBA = 0,
-  IOS = 1
+enum class MACConsumer
+{
+  BBA,
+  IOS
 };
 
 enum
@@ -19,6 +23,9 @@ enum
   MAC_ADDRESS_SIZE = 6
 };
 
-void GenerateMacAddress(const MACConsumer type, u8* mac);
-std::string MacAddressToString(const u8* mac);
-bool StringToMacAddress(const std::string& mac_string, u8* mac);
+using MACAddress = std::array<u8, MAC_ADDRESS_SIZE>;
+
+MACAddress GenerateMacAddress(MACConsumer type);
+std::string MacAddressToString(const MACAddress& mac);
+std::optional<MACAddress> StringToMacAddress(const std::string& mac_string);
+}  // namespace Common
